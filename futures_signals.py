@@ -1,12 +1,188 @@
 import os
+import sys
 import asyncio
+import platform
+import tempfile
+import atexit
+import time
+import signal
 import ccxt
 import pandas as pd
 import numpy as np
 import json
 import urllib.request
+from collections import deque, Counter
 from datetime import datetime, timezone, timedelta
+from typing import Tuple
 import ta
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+_instance_lock_handle = None
+entry_delay_state = {}
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return exit_code.value == 259  # STILL_ACTIVE
+        else:
+            os.kill(pid, 0)
+            return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+def _terminate_pid(pid: int, timeout: float = 5.0) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            PROCESS_TERMINATE = 0x0001
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if handle:
+                ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                ctypes.windll.kernel32.CloseHandle(handle)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except Exception:
+        return False
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        if not _pid_exists(pid):
+            return True
+        time.sleep(0.2)
+    return not _pid_exists(pid)
+
+def acquire_single_instance_lock() -> bool:
+    """
+    Ensure only one bot instance runs at a time.
+    Uses a cross-platform file lock in temp directory.
+    """
+    global _instance_lock_handle
+    lock_path = os.path.join(tempfile.gettempdir(), "futures_signals.lock")
+    try:
+        handle = open(lock_path, "a+")
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                try:
+                    handle.seek(0)
+                    existing_pid = handle.read().strip()
+                    if existing_pid.isdigit() and not _pid_exists(int(existing_pid)):
+                        handle.close()
+                        os.remove(lock_path)
+                        handle = open(lock_path, "a+")
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        if existing_pid.isdigit() and _terminate_pid(int(existing_pid)):
+                            handle.close()
+                            os.remove(lock_path)
+                            handle = open(lock_path, "a+")
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            handle.close()
+                            return False
+                except Exception:
+                    handle.close()
+                    return False
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                try:
+                    handle.seek(0)
+                    existing_pid = handle.read().strip()
+                    if existing_pid.isdigit() and not _pid_exists(int(existing_pid)):
+                        handle.close()
+                        os.remove(lock_path)
+                        handle = open(lock_path, "a+")
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        if existing_pid.isdigit() and _terminate_pid(int(existing_pid)):
+                            handle.close()
+                            os.remove(lock_path)
+                            handle = open(lock_path, "a+")
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        else:
+                            handle.close()
+                            return False
+                except Exception:
+                    handle.close()
+                    return False
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        _instance_lock_handle = handle
+
+        def _release_lock():
+            try:
+                if _instance_lock_handle:
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(_instance_lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(_instance_lock_handle, fcntl.LOCK_UN)
+                    _instance_lock_handle.close()
+            except Exception:
+                pass
+
+        atexit.register(_release_lock)
+        return True
+    except Exception:
+        return False
+
+def sanitize_proxy_env():
+    """Clear invalid local proxy settings that break HTTP calls."""
+    bad_targets = ("127.0.0.1:9", "localhost:9")
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        val = os.environ.get(key)
+        if val and any(t in val for t in bad_targets):
+            os.environ.pop(key, None)
+            print(f"⚠️ Cleared invalid proxy env: {key}={val}")
+
+
+def update_entry_delay_state(symbol, direction, trigger_candle, confirm_candle, required_confirms):
+    state = entry_delay_state.get(symbol)
+    if not state or state.get("direction") != direction:
+        state = {"direction": direction, "trigger": trigger_candle, "confirmed": 0}
+    result = evaluate_entry_delay(state["trigger"], confirm_candle, direction)
+    if result.state == "CANCELLED":
+        entry_delay_state.pop(symbol, None)
+        return result
+    if result.state == "CONFIRMED":
+        state["confirmed"] += 1
+        entry_delay_state[symbol] = state
+        if state["confirmed"] >= required_confirms:
+            return EntryDelayResult("CONFIRMED", f"Confirmed {state['confirmed']}x")
+        return EntryDelayResult("WAITING_CONFIRMATION", f"Need {required_confirms}, have {state['confirmed']}")
+    entry_delay_state[symbol] = state
+    return EntryDelayResult("WAITING_CONFIRMATION", result.reason)
 from ta.trend import ADXIndicator, EMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -15,6 +191,7 @@ from flask import Flask, jsonify, render_template_string, render_template, send_
 import threading
 import qrcode
 import io
+from dotenv import load_dotenv
 
 from quant_analytics import QuantAnalytics, format_analysis_report
 from ml_signals import ml_predictor
@@ -23,9 +200,54 @@ from onchain_analytics import onchain_analytics
 from trade_exit_engine import ExitContext, ExitLevels, calculate_exit_levels
 from signal_density_engine import DensityContext, DensityResult, evaluate_signal_density
 from async_safety_engine import AsyncResult, safe_call, guard_boolean, guard_numeric, safe_len
-from market_regime_engine import RegimeContext, RegimeResult, detect_market_regime as detect_regime_v2
-from net_profit_engine import NetProfitDecision, net_profit_engine
+from market_regime_engine import RegimeContext as RegimeV2Context, RegimeResult, detect_market_regime as detect_regime_v2
+from market_intel_engine import MarketIntelEngine
+from net_profit_engine import (
+    NetProfitDecision, 
+    net_profit_engine,
+    NetProfitContext,
+    NetProfitResult,
+    FeeConfig,
+    optimize_rr_after_fees
+)
+from expectancy_engine import (
+    ExpectancyContext,
+    ExpectancyResult,
+    evaluate_expectancy
+)
 from entry_optimizer_5m import optimize_entry_5m, EntryOptimizationResult
+from entry_timing_filter import EntryTimingContext, entry_timing_filter
+from pullback_entry_engine import PullbackContext, evaluate_pullback_entry, EntryState
+from confluence_gate import ConfluenceContext, evaluate_confluence_gate, ConfluenceDecision
+from impulse_exhaustion_filter import ImpulseContext, evaluate_impulse_exhaustion, ImpulseDecision
+from structure.htf_structure import update_htf_structure, structure_hold, lower_low_printed, detect_swings
+from filters.direction_lock import DirectionLock
+from engine.mode_router import ModeRouter
+from engine.cashflow_engine import process_signal as cashflow_process_signal
+from engine.swing_engine import process_signal as swing_process_signal
+from engine.location_engine import LocationEngine
+from bot.market_state import MarketState, detect_market_state
+from bot.location import Location, location_block
+from bot.breakout import breakout_confirmed
+from bot.indicators import indicator_score
+from bot.decision_engine import evaluate_signal
+from bot.pullback import evaluate_pullback
+from bot.rejection import evaluate_rejection
+from bot.fake_breakout import evaluate_fake_breakout
+from bot.htf_sr import HTFContext, evaluate_htf_sr_gate
+from bot.entry_delay import evaluate_entry_delay, EntryDelayResult
+from bot.market_regime import RegimeContext as DecisionRegimeContext, detect_market_regime as detect_regime_ctx
+from bot.holding_time import estimate_holding_time, HoldTimeContext, estimate_hold_time
+from bot.zone_interaction import ZoneInteraction
+from bot.zone_resolution import (
+    ZoneResolutionEngine,
+    Zone,
+    ZoneType,
+    Candle,
+    ZoneResolutionState,
+)
+from bot.logger import log_decision
+from zone_confidence import ZoneConfidenceContext, calculate_zone_confidence
 from pro_strategies import (
     pro_analyzer, ProSignal, CandleReversal, BoxStrategy, BreakerBlock,
     ElliottWavePhase, FibonacciSweetSpot, ExhaustionGap, 
@@ -33,14 +255,63 @@ from pro_strategies import (
     MoneyFlowIndex, ChaikinMoneyFlow, MoneyFlowDivergence, WaveScore, StopHuntDetector,
     MarketStructure, OrderBlocks, FairValueGap
 )
+from strategy_health_engine import StrategyHealthEngine
+from entry_flow import MarketContext, SignalDecision, evaluate_entry, set_risk_event_logger, calculate_risk_modifier
+from short_entry_flow import ShortMarketContext, evaluate_short_entry
+from trading_hours import TradingHoursOptimizer
+from asset_performance import AssetPerformance
+from auto_adjust_targets import AutoAdjustTargets
+from daily_report import DailyReport
+from sunday_trading import SundayTradingEngine, SundayTradingConfig
+from bear_market_mode import BearMarketConfig, BearMarketEngine
+from config import (
+    PROFIT_MODE_ENABLED as CONFIG_PROFIT_MODE_ENABLED,
+    BEAR_MARKET,
+    RISK,
+    TRADING_HOURS_ENABLED,
+    ZONE_RESOLUTION_MIN_BODY_PCT,
+    ZONE_RESOLUTION_REQUIRED_CLOSES,
+)
+try:
+    from xgboost_trading import XGBoostTradingEngine, XGBoostConfig
+    XGBOOST_AVAILABLE = True
+    XGBOOST_IMPORT_ERROR = None
+except Exception as e:
+    XGBOOST_AVAILABLE = False
+    XGBOOST_IMPORT_ERROR = str(e)
+    XGBoostTradingEngine = None
+    XGBoostConfig = None
+
+# Profit Mode Integration
+try:
+    from profit_mode_simple import SimpleProfitTracker
+    profit_tracker = SimpleProfitTracker()
+    if CONFIG_PROFIT_MODE_ENABLED:
+        print("✅ PROFIT MODE ACTIVATED")
+except ImportError:
+    profit_tracker = None
 
 # ================================
 # CONFIG
 # ================================
+load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+if TELEGRAM_TOKEN:
+    TELEGRAM_TOKEN = TELEGRAM_TOKEN.strip()
+if CHAT_ID:
+    CHAT_ID = CHAT_ID.strip()
 
-# Futures contracts (Perpetual) - 7 assets (BNB removed - no Kraken Perp)
+# Strategy List
+STRATEGY_LIST = [
+    "TREND_CONTINUATION",
+    "PULLBACK",
+    "COUNTER_TREND",
+    "SCALP_REBOUND",
+    "BREAKOUT"
+]
+
+# Futures contracts (Perpetual) - 8 assets (BNB removed - no Kraken Perp)
 FUTURES_ASSETS = [
     "PF_XBTUSD",   # BTC Perpetual
     "PF_ETHUSD",   # ETH Perpetual
@@ -49,6 +320,7 @@ FUTURES_ASSETS = [
     "PF_LTCUSD",   # LTC Perpetual
     "PF_ADAUSD",   # ADA Perpetual
     "PF_DOTUSD",   # DOT Perpetual
+    "PF_LINKUSD",  # LINK Perpetual
 ]
 
 ASSET_NAMES = {
@@ -59,6 +331,7 @@ ASSET_NAMES = {
     "PF_LTCUSD": "LTC",
     "PF_ADAUSD": "ADA",
     "PF_DOTUSD": "DOT",
+    "PF_LINKUSD": "LINK",
 }
 
 # Timeframes
@@ -67,14 +340,17 @@ TIMEFRAME_TREND = "1h"    # Trend analysis
 TIMEFRAME_ENTRY = "15m"   # Entry signals
 TIMEFRAME_5M_OPTIMIZE = "5m"   # v8.9.24: Entry optimization only (no signal generation)
 TIMEFRAME_DAILY = "1d"    # Daily liquidity zones (v8.5)
+TIMEFRAME_WEEKLY = "1w"
 
 # Signal settings
-CHECK_INTERVAL = 60       # Check every 60 seconds
-MIN_SCORE = 60            # v8.9.20: Balanced threshold for quality signals
-LEVERAGE = 10             # Kraken Futures fixed leverage
+CHECK_INTERVAL = 30  # Day trading / cashflow mode – faster signal detection
+MIN_SCORE = 0            # Disable score-based veto
+LEVERAGE = 5              # Kraken Futures fixed leverage
+MIN_SIGNAL_CONFIDENCE = 0.50  # Minimum confidence to send signals
+SIGNAL_COOLDOWN_MINUTES = 30  # Minimum time between signals per asset
 
 # Indicator settings
-RSI_OVERSOLD = 27.0       # v8.9.22: Profesionalus lygis - TIK ekstremali oversold
+RSI_OVERSOLD = 30.0       # Cashflow mode: allow less extreme oversold
 RSI_OVERBOUGHT = 69.50    # Overbought level (slightly below 70 for earlier entry)
 ADX_MIN = 20
 ADX_STRONG = 30
@@ -100,19 +376,52 @@ PARTIAL_MIN_SIZE_USD = 5.0    # Minimum position size to close (Kraken minimum)
 # ================================
 # AUTO-TRADING SETTINGS (v8.6)
 # ================================
-AUTO_TRADING_ENABLED = True       # Enable automatic position opening/closing
-AUTO_TRADE_MARGIN_USD = 25         # Initial margin in USD per trade (position = margin × leverage)
-AUTO_TRADE_MAX_POSITIONS = 3       # Maximum concurrent open positions
-AUTO_TRADE_MIN_SCORE = 60          # Minimum score to auto-execute trade
+AUTO_TRADING_ENABLED = False     # Enable automatic position opening/closing
+DISABLE_KRAKEN_IN_SIGNAL_ONLY = True  # Skip Kraken balance/positions when signal-only
+AUTO_TRADE_MARGIN_USD = 50         # Initial margin in USD per trade (position = margin × leverage)
+MAX_MARGIN_USD = 50                # Hard cap per-trade margin in USD
+MAX_MARGIN_EUR = 50                # Hard cap per-trade margin in EUR (FX converted)
+AUTO_TRADE_MAX_POSITIONS = RISK["MAX_POSITIONS"]       # Maximum concurrent open positions
+AUTO_TRADE_MIN_SCORE = 0
 AUTO_CLOSE_ON_SL = True            # Automatically close position when SL is hit
 AUTO_CLOSE_ON_TP3 = True           # Automatically close remaining position at TP3
 
 # ================================
+# PROFIT MODE CONFIGURATION
+# ================================
+PROFIT_MODE_ENABLED = False  # Disable cashflow gating to avoid mixing
+DAILY_PROFIT_TARGET_EUR = 10  # 10€ per dieną
+WEEKLY_PROFIT_TARGET_EUR = 60  # 60€ per savaitę
+MIN_PROFIT_PER_TRADE_EUR = 1  # Minimalus pelnas vienam trade'ui
+MAX_TRADES_PER_DAY = 10  # Maksimalus trade'ų skaičius per dieną
+AUTO_ADJUST_TARGETS_ENABLED = True  # Auto-adjust daily target based on recent performance
+
+# ================================
+# POSITION CORRELATION CHECK
+# ================================
+POSITION_CORRELATION_ENABLED = True
+POSITION_CORRELATION_THRESHOLD = 0.7
+POSITION_CORRELATION_LOOKBACK = 80
+POSITION_CORRELATION_MIN_POINTS = 20
+POSITION_CORRELATION_TIMEFRAME = TIMEFRAME_TREND
+
+# Signalų filtravimo pakeitimai
+PROFIT_MODE_MIN_SCORE = 0
+PROFIT_MODE_MIN_CONFIDENCE = 0.0
+ACCEPT_PARTIAL_CONFLUENCE = True  # Priimti signalus su daline confluence
+
+# Strategijų aktyvacija
+ENABLE_SCALPING = False
+ENABLE_DAY_TRADING = True
+ENABLE_SWING_TRADING = True
+
+# ================================
 # ACCOUNT & RISK LIMITS (v8.9.18)
 # ================================
-DAILY_LOSS_LIMIT_PCT = 2.0         # Max daily loss as % of capital (-2%)
-WEEKLY_LOSS_LIMIT_PCT = 5.0        # Max weekly loss as % of capital (-5%)
+DAILY_LOSS_LIMIT_PCT = RISK["DAILY_LOSS_LIMIT_PCT"]         # Max daily loss as % of capital (-2%)
+WEEKLY_LOSS_LIMIT_PCT = RISK["WEEKLY_LOSS_LIMIT_PCT"]        # Max weekly loss as % of capital (-5%)
 DAILY_LOSS_LIMIT_USD = 20          # Fallback: absolute $ limit if balance unavailable
+MAX_DRAWDOWN_PCT = 10.0            # Maximum drawdown from peak equity (-10%) - v8.9.25
 
 # ================================
 # DYNAMIC LEVERAGE SETTINGS (v8.9)
@@ -120,16 +429,39 @@ DAILY_LOSS_LIMIT_USD = 20          # Fallback: absolute $ limit if balance unava
 DYNAMIC_LEVERAGE_ENABLED = True   # Enable automatic leverage selection based on signal strength
 MAX_RISK_PER_TRADE_USD = 4.0      # Maximum risk per trade in USD (fits 5 trades in $20 daily limit)
 
+# ================================
+# ENTRY EXECUTION TUNING (v8.9.28)
+# ================================
+LIMIT_ORDER_WAIT_SECONDS = 24          # Total wait for limit fill
+LIMIT_CHASE_INTERVAL_SECONDS = 6       # How often to chase price
+LIMIT_CHASE_MAX_STEPS = 3              # Number of chase attempts
+LIMIT_CHASE_STEP_PCT = 0.06            # Marketable limit offset (%)
+LIMIT_MAX_SLIPPAGE_PCT = 0.10          # Max allowed offset from initial price (%)
+LIMIT_FALLBACK_TO_MARKET = True        # Fallback to market on timeout (high-quality only)
+LIMIT_FALLBACK_MIN_SCORE = 0
+ENTRY_OPTIMIZED_MAX_DEVIATION_PCT = 0.25  # Max optimized entry deviation (%)
+
+# ================================
+# FX RATE CACHE (EUR → USD)
+# ================================
+FX_RATE_CACHE_SECONDS = 3600
+EUR_USD_FALLBACK_RATE = 1.04
+
+# ================================
+# LEVERAGE LIMITS
+# ================================
+MAX_LEVERAGE = 5
+
 # Leverage tiers based on signal confidence
 LEVERAGE_TIERS = {
     "STRONG": {
-        "leverage": 10,
+        "leverage": 5,
         "min_score": 85,
         "min_ml_confidence": 0.68,
         "min_confirmations": 5,
     },
     "MEDIUM": {
-        "leverage": 5,
+        "leverage": 4,
         "min_score": 80,
         "min_ml_confidence": 0.60,
         "min_confirmations": 4,
@@ -149,6 +481,11 @@ LEVERAGE_TIERS = {
 }
 
 # ================================
+# HTTP SERVER
+# ================================
+ENABLE_HTTP_SERVER = False  # Disable Flask UI/API when not needed
+
+# ================================
 # MARKET REGIME DETECTION (from v7.4)
 # ================================
 MARKET_REGIME_ENABLED = True
@@ -160,8 +497,10 @@ DEFENSIVE_MODE_ENABLED = True # Block new LONGs in BEAR market
 # ================================
 # SMART COUNTER-TREND (v8.9.2)
 # ================================
-QUANT_COUNTER_TREND_ENABLED = True   # Allow LONGs against trend with strong quant confirmation
+QUANT_ENABLED = False                # Fully disable AI/Quant processing
+QUANT_COUNTER_TREND_ENABLED = False  # Disable quant-based counter-trend
 QUANT_COUNTER_TREND_MIN_BIAS = 15    # Minimum quant score to allow counter-trend LONG (+15 or higher)
+QUANT_DIRECTION_ENABLED = False      # Disable AI/Quant from direction decisions
 
 # ================================
 # S&P 500 + MACRO INDICATORS (from v7.5/v7.6)
@@ -193,7 +532,7 @@ KRAKEN_MAKER_FEE = 0.0002     # 0.02% maker fee
 KRAKEN_TAKER_FEE = 0.0005     # 0.05% taker fee
 # Round-trip fees (open + close)
 MIN_PROFIT_PCT = 0.15         # TP1 must be at least 0.15% to cover fees + small profit
-# With 10x leverage: 0.15% price move = 1.5% account profit
+# With 5x leverage: 0.15% price move = 0.75% account profit
 
 # ================================
 # RR ENGINE v2.0 (v8.9.24 - HYBRID FUND MODE)
@@ -213,6 +552,8 @@ class RRContext:
     higher_tf_bias: str = "NEUTRAL"  # v8.9.24: BULL / BEAR / NEUTRAL
     setup_type: str = "CONTINUATION"  # v8.9.24: CONTINUATION / PULLBACK / REVERSAL
     volatility_level: str = "NORMAL"  # v8.9.24: LOW / NORMAL / HIGH
+    direction: str = "LONG"      # "LONG" | "SHORT"
+    confluence_score: float = 0.0
 
 @dataclass
 class RRResult:
@@ -225,82 +566,30 @@ class RRResult:
     reason: str
     rr_adjustments: str = ""  # v8.9.24: Explanation of adjustments
 
-def get_min_rr(context: RRContext) -> tuple:
+def get_min_rr(direction: str, trend_strength: str, confluence_score: float) -> tuple:
     """
-    v8.9.24 HYBRID: Dynamic min R:R calculation
+    Dynamic RR for DAY / CASHFLOW mode.
     Returns (min_rr, adjustments_explanation)
     """
-    base_rr = 1.2
-    rr = base_rr
-    reasons = []
-    
-    # Counter-trend override (highest priority)
-    if context.is_countertrend:
-        return (1.8, "Counter-trend → 1.8 min")
-    
-    # 1. Market Regime
-    if context.market_regime == "RANGE":
-        rr += 0.5
-        reasons.append("RANGE +0.5")
-    elif context.market_regime in ("BULL", "BEAR"):
-        rr += 0.2
-        reasons.append(f"{context.market_regime} +0.2")
-    
-    # 2. Trend Strength
-    if "STRONG" in context.trend_strength:
-        rr -= 0.2
-        reasons.append("STRONG -0.2")
-    elif context.trend_strength == "WEAK":
-        rr += 0.4
-        reasons.append("WEAK +0.4")
-    
-    # 3. Higher Timeframe Bias
-    if context.higher_tf_bias == "NEUTRAL":
-        rr += 0.3
-        reasons.append("HTF_NEUTRAL +0.3")
-    
-    # 4. Setup Type
-    if context.setup_type == "CONTINUATION":
-        rr -= 0.2
-        reasons.append("CONT -0.2")
-    elif context.setup_type == "PULLBACK":
-        rr += 0.1
-        reasons.append("PULLBACK +0.1")
-    elif context.setup_type == "REVERSAL":
-        rr += 0.6
-        reasons.append("REVERSAL +0.6")
-    
-    # 5. Volatility (from atr_ratio)
-    if context.volatility_level == "HIGH" or context.atr_ratio >= 1.4:
-        rr += 0.3
-        reasons.append("HIGH_VOL +0.3")
-    elif context.volatility_level == "LOW" or context.atr_ratio < 0.7:
-        rr -= 0.1
-        reasons.append("LOW_VOL -0.1")
-    
-    # 6. Scalp mode override (aggressive continuation)
-    if context.trend_strength == "STRONG" and context.atr_ratio >= 1.4 and context.setup_type == "CONTINUATION":
-        rr = max(0.6, rr - 0.4)  # Allow aggressive scalps
-        reasons.append("SCALP_MODE")
-    
-    # 7. Safety Clamp
-    rr = round(max(1.0, min(rr, 3.5)), 2)
-    
-    return (rr, " | ".join(reasons) if reasons else "base")
+    min_rr = 0.7
+    reasons = ["base 0.7"]
+
+    if trend_strength in ["STRONG_BULL", "STRONG_BEAR", "STRONG"]:
+        min_rr = 0.6
+        reasons.append("strong trend 0.6")
+
+    if confluence_score < 50:
+        min_rr = 1.0
+        reasons.append("low confluence 1.0")
+
+    return (round(min_rr, 2), " | ".join(reasons))
 
 def rr_penalty(rr: float, min_rr: float) -> float:
     """Soft penalty system instead of hard blocking"""
     if rr >= min_rr:
         return 0.0
     diff = min_rr - rr
-    if diff <= 0.15:
-        return -5.0
-    elif diff <= 0.35:
-        return -10.0
-    elif diff <= 0.6:
-        return -18.0
-    else:
-        return -999.0  # Only extreme cases blocked
+    return -float(int(diff * 20))
 
 def is_scalp_mode(context: RRContext) -> bool:
     """Detects high-probability scalp environment"""
@@ -312,24 +601,16 @@ def is_scalp_mode(context: RRContext) -> bool:
     )
 
 def evaluate_rr(context: RRContext) -> RRResult:
-    """Main RR evaluation entry point - v8.9.24 HYBRID"""
-    min_rr, rr_adjustments = get_min_rr(context)
+    """Main RR evaluation entry point - Dynamic RR + soft penalty"""
+    min_rr, rr_adjustments = get_min_rr(
+        context.direction,
+        context.trend_strength,
+        context.confluence_score
+    )
     penalty = rr_penalty(context.rr, min_rr)
     scalp = is_scalp_mode(context)
-    base_rr = 1.2
-    
-    if penalty <= -999:
-        return RRResult(
-            allowed=False,
-            final_score=context.score,
-            min_rr=min_rr,
-            base_rr=base_rr,
-            penalty=penalty,
-            scalp_mode=scalp,
-            reason=f"RR_TOO_BAD ({context.rr:.2f} < {min_rr:.2f})",
-            rr_adjustments=rr_adjustments
-        )
-    
+    base_rr = 0.7
+
     final_score = context.score + penalty
     if final_score < 0:
         return RRResult(
@@ -350,7 +631,7 @@ def evaluate_rr(context: RRContext) -> RRResult:
         base_rr=base_rr,
         penalty=penalty,
         scalp_mode=scalp,
-        reason="RR_OK",
+        reason="RR_OK" if penalty >= 0 else f"RR_SOFT ({context.rr:.2f} < {min_rr:.2f})",
         rr_adjustments=rr_adjustments
     )
 
@@ -481,7 +762,11 @@ VWAP_STRICT_MODE = False      # If True, block signals against VWAP bias complet
 # CIRCUIT BREAKERS (from v6.0)
 # ================================
 CIRCUIT_BREAKER_ENABLED = True
-MAX_CONSECUTIVE_LOSSES = 3    # Pause after 3 losses in a row
+MAX_CONSECUTIVE_LOSSES = 3    # Hard pause after 3 losses in a row
+LOSS_COOLDOWN_ENABLED = True
+LOSS_COOLDOWN_AFTER = 2       # Cooldown after 2 losses in a row
+LOSS_COOLDOWN_MINUTES = 60    # Cooldown duration after 2 losses
+LOSS_COOLDOWN_HARD_MINUTES = 180  # Cooldown duration after 3 losses
 VOLATILITY_CIRCUIT_THRESHOLD = 0.08  # 8% daily volatility = pause
 
 # ================================
@@ -518,6 +803,28 @@ FOMC_DATES = [
 # Kraken Futures API credentials (for position tracking)
 KRAKEN_FUTURES_API_KEY = os.getenv("KRAKEN_FUTURES_API_KEY")
 KRAKEN_FUTURES_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
+if KRAKEN_FUTURES_API_KEY:
+    KRAKEN_FUTURES_API_KEY = KRAKEN_FUTURES_API_KEY.strip()
+if KRAKEN_FUTURES_SECRET:
+    KRAKEN_FUTURES_SECRET = KRAKEN_FUTURES_SECRET.strip()
+
+
+# ================================
+# API KEY VALIDATION (STARTUP CHECK)
+# ================================
+def validate_api_keys():
+    """
+    Validate that required API keys are present before starting the bot.
+    Only validates if AUTO_TRADING_ENABLED is True (keys required for trading).
+    Raises ValueError if keys are missing when trading is enabled.
+    """
+    # Only validate if auto-trading is enabled (keys required)
+    if AUTO_TRADING_ENABLED:
+        if not KRAKEN_FUTURES_API_KEY:
+            raise ValueError("KRAKEN_FUTURES_API_KEY missing - required for auto-trading")
+        
+        if not KRAKEN_FUTURES_SECRET:
+            raise ValueError("KRAKEN_FUTURES_SECRET missing - required for auto-trading")
 
 # Create authenticated exchange if credentials available
 if KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_SECRET:
@@ -546,6 +853,375 @@ account_balance_cache = {
     "consecutive_failures": 0,
 }
 
+fx_rate_cache = {
+    "eur_usd": EUR_USD_FALLBACK_RATE,
+    "last_update": None,
+}
+
+def get_eur_usd_rate() -> float:
+    """Get EUR→USD FX rate with caching and fallback."""
+    global fx_rate_cache
+    
+    now = datetime.now(timezone.utc)
+    last_update = fx_rate_cache.get("last_update")
+    if last_update and (now - last_update).total_seconds() < FX_RATE_CACHE_SECONDS:
+        return fx_rate_cache.get("eur_usd", EUR_USD_FALLBACK_RATE)
+    
+    try:
+        url = "https://api.exchangerate.host/latest?base=EUR&symbols=USD"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            rate = data.get("rates", {}).get("USD", None)
+            if rate:
+                fx_rate_cache["eur_usd"] = float(rate)
+                fx_rate_cache["last_update"] = now
+                return fx_rate_cache["eur_usd"]
+    except Exception as e:
+        print(f"⚠️ FX rate fetch error: {e}")
+    
+    fx_rate_cache["eur_usd"] = fx_rate_cache.get("eur_usd", EUR_USD_FALLBACK_RATE) or EUR_USD_FALLBACK_RATE
+    fx_rate_cache["last_update"] = now
+    return fx_rate_cache["eur_usd"]
+
+def get_usd_eur_rate() -> float:
+    """Get USD→EUR FX rate derived from EUR→USD."""
+    eur_usd = get_eur_usd_rate()
+    if eur_usd <= 0:
+        return 1 / EUR_USD_FALLBACK_RATE
+    return 1 / eur_usd
+
+# ================================
+# PROFIT TRACKER (EUR)
+# ================================
+class ProfitTracker:
+    """Sekti pelno tikslus ir reguliuoti trading aktyvumą."""
+
+    def __init__(self):
+        self.daily_profit = 0.0
+        self.weekly_profit = 0.0
+        self.daily_trades = 0
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
+        self.today_start = datetime.now(timezone.utc).date()
+        self.week_start = self.get_week_start()
+        self.aggression = 1.0
+
+    def get_week_start(self):
+        """Get Monday of current week (UTC)."""
+        today = datetime.now(timezone.utc).date()
+        return today - timedelta(days=today.weekday())
+
+    def add_trade_result(self, profit_eur: float, position_size_eur: float = None):
+        """Add trade result and update metrics."""
+        self.daily_profit += profit_eur
+        self.weekly_profit += profit_eur
+        self.daily_trades += 1
+
+        if profit_eur > 0:
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            if self.consecutive_wins >= 2:
+                self.aggression = min(2.0, self.aggression * 1.2)
+        else:
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+            if self.consecutive_losses >= 2:
+                self.aggression = max(0.5, self.aggression * 0.7)
+
+        self.check_reset_daily()
+
+    def check_reset_daily(self):
+        """Reset daily counters if new day."""
+        if datetime.now(timezone.utc).date() != self.today_start:
+            if AUTO_ADJUST_TARGETS_ENABLED:
+                auto_adjust_targets.update(self.daily_profit)
+            self.daily_profit = 0.0
+            self.daily_trades = 0
+            self.today_start = datetime.now(timezone.utc).date()
+            self.aggression = 1.0
+
+        if datetime.now(timezone.utc).date() > self.week_start + timedelta(days=6):
+            self.weekly_profit = 0.0
+            self.week_start = self.get_week_start()
+
+    def should_trade_more(self):
+        """Check if we should continue trading today."""
+        current_target = auto_adjust_targets.current_target if AUTO_ADJUST_TARGETS_ENABLED else DAILY_PROFIT_TARGET_EUR
+        if self.daily_profit >= current_target:
+            return False, "Daily profit target reached"
+
+        if self.daily_trades >= MAX_TRADES_PER_DAY:
+            return False, "Daily trade limit reached"
+
+        if self.daily_profit >= current_target * 0.8:
+            return True, "Profit-taking mode (reduce risk)"
+
+        return True, "Continue trading"
+
+    def get_position_multiplier(self):
+        """Get position size multiplier based on performance."""
+        base_multiplier = 1.0
+        hour = datetime.now(timezone.utc).hour
+        if self.daily_profit < DAILY_PROFIT_TARGET_EUR * 0.5 and hour < 20:
+            base_multiplier *= 1.3
+
+        base_multiplier *= self.aggression
+
+        if self.daily_profit >= DAILY_PROFIT_TARGET_EUR * 0.8:
+            base_multiplier *= 0.7
+
+        return min(base_multiplier, 2.0)
+
+
+class QuickProfitStrategies:
+    """Greito pelno strategijos."""
+
+    @staticmethod
+    def generate_scalp_signal(df_5m, asset):
+        if df_5m is None or len(df_5m) < 50:
+            return None
+
+        rsi = RSIIndicator(df_5m['close'], window=14).rsi()
+        current_rsi = rsi.iloc[-1]
+
+        bb = BollingerBands(df_5m['close'], window=20, window_dev=2)
+        bb_upper = bb.bollinger_hband()
+        bb_lower = bb.bollinger_lband()
+
+        current_price = df_5m['close'].iloc[-1]
+
+        if current_price <= bb_lower.iloc[-1] * 1.01 and current_rsi < 35:
+            return {
+                'type': 'LONG',
+                'strategy': 'SCALP_5M',
+                'timeframe': '5m',
+                'confidence': 0.65,
+                'profit_target_pct': 0.5,
+                'stop_loss_pct': 0.25,
+                'hold_time_minutes': 15
+            }
+
+        if current_price >= bb_upper.iloc[-1] * 0.99 and current_rsi > 65:
+            return {
+                'type': 'SHORT',
+                'strategy': 'SCALP_5M',
+                'timeframe': '5m',
+                'confidence': 0.65,
+                'profit_target_pct': 0.5,
+                'stop_loss_pct': 0.25,
+                'hold_time_minutes': 15
+            }
+
+        return None
+
+    @staticmethod
+    def generate_swing_signal(df_1h, asset):
+        if df_1h is None or len(df_1h) < 100:
+            return None
+
+        ema_12 = df_1h['close'].ewm(span=12).mean()
+        ema_26 = df_1h['close'].ewm(span=26).mean()
+
+        macd = MACD(df_1h['close'])
+        macd_line = macd.macd()
+        signal_line = macd.macd_signal()
+
+        current_ema_12 = ema_12.iloc[-1]
+        current_ema_26 = ema_26.iloc[-1]
+        current_macd = macd_line.iloc[-1]
+        current_signal = signal_line.iloc[-1]
+
+        if current_ema_12 > current_ema_26 and current_macd > current_signal and current_macd > 0:
+            support = df_1h['low'].rolling(20).min().iloc[-1]
+            current_price = df_1h['close'].iloc[-1]
+            risk_pct = (current_price - support) / current_price
+            if risk_pct < 0.02:
+                return {
+                    'type': 'LONG',
+                    'strategy': 'SWING_1H',
+                    'timeframe': '1h',
+                    'confidence': 0.70,
+                    'profit_target_pct': 2.0,
+                    'stop_loss_pct': risk_pct * 100,
+                    'hold_time_hours': 24
+                }
+
+        return None
+
+
+profit_tracker = ProfitTracker()
+quick_strategies = QuickProfitStrategies()
+asset_performance = AssetPerformance()
+auto_adjust_targets = AutoAdjustTargets(DAILY_PROFIT_TARGET_EUR)
+xgb_engine = None
+sunday_engine = SundayTradingEngine(SundayTradingConfig())
+
+def profit_mode_allows(signal):
+    """Apply profit mode thresholds to a signal."""
+    if not PROFIT_MODE_ENABLED:
+        return True
+    if signal.get('score', 0) < PROFIT_MODE_MIN_SCORE:
+        return False
+    if signal.get('confidence', 0) < PROFIT_MODE_MIN_CONFIDENCE:
+        return False
+    if not ACCEPT_PARTIAL_CONFLUENCE:
+        if signal.get('confluence_score', 0) < 55:
+            return False
+    return True
+
+def build_quick_signal(symbol, direction, base_price, strategy_name, confidence, profit_target_pct, stop_loss_pct):
+    """Build a signal dict compatible with the bot."""
+    sl_distance = base_price * (stop_loss_pct / 100)
+    tp_distance = base_price * (profit_target_pct / 100)
+    if direction == "LONG":
+        sl = base_price - sl_distance
+        tp1 = base_price + tp_distance
+        tp2 = base_price + (tp_distance * 1.5)
+        tp3 = base_price + (tp_distance * 2.5)
+    else:
+        sl = base_price + sl_distance
+        tp1 = base_price - tp_distance
+        tp2 = base_price - (tp_distance * 1.5)
+        tp3 = base_price - (tp_distance * 2.5)
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "score": int(PROFIT_MODE_MIN_SCORE + 5),
+        "base_score": PROFIT_MODE_MIN_SCORE,
+        "signals": [strategy_name, "PROFIT_MODE"],
+        "price": base_price,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "atr": 0,
+        "rsi": 50.0,
+        "trend": "NEUTRAL",
+        "confidence": confidence,
+        "modules_used": 1,
+        "entry_type": "MARKET",
+        "entry_reason": "💰 Profit mode quick signal",
+        "strategy_name": "SCALP_REBOUND" if "SCALP" in strategy_name else "TREND_CONTINUATION",
+        "time": datetime.now(timezone.utc)
+    }
+
+def build_xgb_market_data(df_15m, df_1h, df_4h, signal, current_price):
+    market_data = {}
+    try:
+        if df_15m is not None and len(df_15m) >= 30:
+            close_15m = df_15m["close"]
+            rsi_14 = calc_rsi(close_15m, period=14).iloc[-1]
+            rsi_28 = calc_rsi(close_15m, period=28).iloc[-1]
+            market_data["rsi_14"] = float(rsi_14)
+            market_data["rsi_28"] = float(rsi_28)
+
+            macd = MACD(close_15m)
+            market_data["macd"] = float(macd.macd().iloc[-1])
+            market_data["macd_signal"] = float(macd.macd_signal().iloc[-1])
+            market_data["macd_histogram"] = float(macd.macd_diff().iloc[-1])
+
+            bb = BollingerBands(close_15m)
+            bb_upper = bb.bollinger_hband().iloc[-1]
+            bb_lower = bb.bollinger_lband().iloc[-1]
+            bb_mid = bb.bollinger_mavg().iloc[-1]
+            bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid else 0.1
+            if current_price <= bb_lower:
+                bb_position = -1
+            elif current_price >= bb_upper:
+                bb_position = 1
+            else:
+                bb_position = 0
+            market_data["bb_width"] = float(bb_width)
+            market_data["bb_position"] = float(bb_position)
+
+            atr = calc_atr(df_15m).iloc[-1]
+            atr_pct = (atr / current_price) if current_price > 0 else 0.02
+            market_data["atr"] = float(atr)
+            market_data["atr_pct"] = float(atr_pct)
+
+            if "volume" in df_15m.columns and len(df_15m) >= 20:
+                volume_ma = df_15m["volume"].rolling(20).mean().iloc[-1]
+                current_volume = df_15m["volume"].iloc[-1]
+                market_data["volume_ma_ratio"] = float(current_volume / volume_ma) if volume_ma else 1.0
+                market_data["volume_vs_avg"] = market_data["volume_ma_ratio"]
+        if df_1h is not None and len(df_1h) >= 50:
+            close_1h = df_1h["close"]
+            ema20 = calc_ema(close_1h, 20).iloc[-1]
+            ema50 = calc_ema(close_1h, 50).iloc[-1]
+            ema200 = calc_ema(close_1h, 200).iloc[-1] if len(close_1h) >= 200 else ema50
+            market_data["ema_20"] = float(ema20)
+            market_data["ema_50"] = float(ema50)
+            market_data["ema_200"] = float(ema200)
+            market_data["price_vs_ema20"] = (current_price - ema20) / ema20 if ema20 else 0
+            market_data["price_vs_ema50"] = (current_price - ema50) / ema50 if ema50 else 0
+            market_data["price_vs_ema200"] = (current_price - ema200) / ema200 if ema200 else 0
+
+            recent_low = df_1h["low"].rolling(20).min().iloc[-1]
+            recent_high = df_1h["high"].rolling(20).max().iloc[-1]
+            market_data["dist_to_support_pct"] = (current_price - recent_low) / current_price if current_price else 0.05
+            market_data["dist_to_resistance_pct"] = (recent_high - current_price) / current_price if current_price else 0.05
+    except Exception:
+        pass
+
+    last_candle = df_15m.iloc[-1] if df_15m is not None and len(df_15m) > 0 else None
+    if last_candle is not None and current_price > 0:
+        candle_body = abs(last_candle["close"] - last_candle["open"])
+        candle_range = max(1e-9, last_candle["high"] - last_candle["low"])
+        market_data["candle_size_pct"] = float(candle_body / current_price * 100)
+        market_data["candle_body_ratio"] = float(candle_body / candle_range)
+        market_data["wick_ratio"] = float((candle_range - candle_body) / candle_range)
+
+    market_data["market_regime"] = market_regime_state.get("regime", "NEUTRAL")
+    market_data["corr_btc"] = 0
+    signal["asset"] = ASSET_NAMES.get(signal.get("symbol", ""), signal.get("symbol", "BTC"))
+    signal["strategy"] = signal.get("strategy_name", "TREND_CONTINUATION")
+    return market_data
+
+def _returns_from_df(df):
+    if df is None or "close" not in df:
+        return None
+    closes = df["close"].astype(float)
+    returns = closes.pct_change().dropna()
+    if len(returns) < POSITION_CORRELATION_MIN_POINTS:
+        return None
+    return returns
+
+async def check_position_correlation(symbol, direction, df_reference=None):
+    """Block signal if highly correlated with an existing position in same direction."""
+    if not POSITION_CORRELATION_ENABLED:
+        return False, None
+    if not open_positions:
+        return False, None
+
+    current_returns = _returns_from_df(df_reference)
+    if current_returns is None:
+        df_ref = await fetch_ohlcv(symbol, POSITION_CORRELATION_TIMEFRAME, POSITION_CORRELATION_LOOKBACK)
+        current_returns = _returns_from_df(df_ref)
+    if current_returns is None:
+        return False, None
+
+    for open_symbol, pos in open_positions.items():
+        if open_symbol == symbol:
+            continue
+        if pos.get("direction") != direction:
+            continue
+
+        df_other = await fetch_ohlcv(open_symbol, POSITION_CORRELATION_TIMEFRAME, POSITION_CORRELATION_LOOKBACK)
+        other_returns = _returns_from_df(df_other)
+        if other_returns is None:
+            continue
+
+        min_len = min(len(current_returns), len(other_returns))
+        corr = current_returns.tail(min_len).corr(other_returns.tail(min_len))
+        if corr is None or pd.isna(corr):
+            continue
+
+        if abs(corr) >= POSITION_CORRELATION_THRESHOLD:
+            return True, f"{open_symbol} corr={corr:.2f}"
+
+    return False, None
+
 def fetch_multi_collateral_balance():
     """
     Gauti balansą iš visų Kraken Futures collateral account tipų:
@@ -556,6 +1232,9 @@ def fetch_multi_collateral_balance():
     global account_balance_cache
     
     if not POSITION_TRACKING_ENABLED:
+        return account_balance_cache
+    
+    if DISABLE_KRAKEN_IN_SIGNAL_ONLY and not AUTO_TRADING_ENABLED:
         return account_balance_cache
     
     try:
@@ -597,15 +1276,18 @@ def fetch_multi_collateral_balance():
                         except:
                             pass
                     elif currency == 'EUR':
-                        eur_usd_rate = 1.04
+                        eur_usd_rate = get_eur_usd_rate()
                         eur_usd = total * eur_usd_rate
                         flex_usd += eur_usd
                         collaterals[currency]['usd_value'] = eur_usd
         
         total_usd = cash_usd + flex_usd
+        usd_eur_rate = get_usd_eur_rate()
+        total_eur = total_usd * usd_eur_rate
         
         account_balance_cache = {
             "total_usd": round(total_usd, 2),
+            "total_eur": round(total_eur, 2),
             "cash_usd": round(cash_usd, 2),
             "flex_usd": round(flex_usd, 2),
             "collaterals": collaterals,
@@ -655,7 +1337,245 @@ bot_stats = {
     "last_heartbeat": None,
 }
 
-HEARTBEAT_INTERVAL = 3600  # 1 hour in seconds
+telegram_stats = {
+    "last_send": None,
+    "last_method": None,
+    "last_message_id": None,
+    "last_error": None,
+    "last_error_type": None,
+    "last_chat_id_masked": None,
+}
+
+# ================================
+# ADAPTIVE FILTERING (signal flow)
+# ================================
+ADAPTIVE_ENABLED = True
+ADAPTIVE_SIGNAL_WINDOW_MIN = 180  # minutes for signal-rate tracking
+ADAPTIVE_LOG_INTERVAL_MIN = 30
+BOUNCE_LONG_ENABLED = True
+BOUNCE_LONG_MIN_CONFLUENCE = 45
+
+# Auto-tune filters based on live block stats
+AUTO_TUNE_ENABLED = True
+AUTO_TUNE_APPLY_INTERVAL_MIN = 10
+AUTO_TUNE_SIGNAL_WINDOW_MIN = 90
+AUTO_TUNE_MIN_BLOCKS = 1
+AUTO_TUNE_MAX_LEVEL = 3
+AUTO_TUNE_TARGETS = [
+    "PULLBACK_ENGINE",
+    "IMPULSE_FILTER",
+    "RSI_1H_PREFILTER",
+    "CONSOLIDATION",
+    "CONFLUENCE_GATE",
+    "ORDER_FLOW",
+    "ENTRY_TIMING",
+]
+
+# EMA distance override (strong bear only)
+EMA_DISTANCE_OVERRIDE_ENABLED = True
+EMA_DISTANCE_OVERRIDE_MIN_SCORE = 40
+
+# Trade mode: CASHFLOW or SWING
+TRADE_MODE = "CASHFLOW"
+
+ZONE_IMPULSE_MULT = 1.5
+ZONE_BUFFER_ATR = 0.2
+
+adaptive_state = {
+    "recent_signals": deque(),
+    "last_signal_time": None,
+    "last_log_time": None,
+    "last_relax_level": 0,
+    "blocked_counts": Counter(),
+    "last_block_reset": None,
+}
+
+auto_tune_state = {
+    "levels": {
+        "PULLBACK_ENGINE": 0,
+        "IMPULSE_FILTER": 0,
+        "RSI_1H_PREFILTER": 0,
+        "CONSOLIDATION": 0,
+        "CONFLUENCE_GATE": 0,
+        "ORDER_FLOW": 0,
+        "ENTRY_TIMING": 0,
+    },
+    "last_apply": None,
+}
+
+def _prune_recent_signals(now: datetime, window_min: int = ADAPTIVE_SIGNAL_WINDOW_MIN):
+    window = timedelta(minutes=window_min)
+    dq = adaptive_state["recent_signals"]
+    while dq and (now - dq[0]) > window:
+        dq.popleft()
+
+def record_signal_sent():
+    if not ADAPTIVE_ENABLED:
+        return
+    now = datetime.now(timezone.utc)
+    adaptive_state["recent_signals"].append(now)
+    adaptive_state["last_signal_time"] = now
+    _prune_recent_signals(now)
+
+def get_recent_signal_count(window_min: int = AUTO_TUNE_SIGNAL_WINDOW_MIN) -> int:
+    now = datetime.now(timezone.utc)
+    _prune_recent_signals(now, window_min=window_min)
+    return len(adaptive_state["recent_signals"])
+
+def get_auto_tune_level(filter_name: str) -> int:
+    return int(auto_tune_state["levels"].get(filter_name, 0))
+
+def get_effective_relax_level(filter_name: str) -> int:
+    base = get_adaptive_relax_level()
+    extra = get_auto_tune_level(filter_name)
+    return min(5, base + extra)
+
+def maybe_apply_auto_tune():
+    if not AUTO_TUNE_ENABLED:
+        return
+    now = datetime.now(timezone.utc)
+    last_apply = auto_tune_state.get("last_apply")
+    if last_apply and (now - last_apply).total_seconds() < AUTO_TUNE_APPLY_INTERVAL_MIN * 60:
+        return
+    recent_signals = get_recent_signal_count()
+    blocks = adaptive_state["blocked_counts"]
+    tuned = []
+    decayed = []
+    if recent_signals == 0:
+        for filter_name in AUTO_TUNE_TARGETS:
+            if blocks.get(filter_name, 0) >= AUTO_TUNE_MIN_BLOCKS:
+                current = get_auto_tune_level(filter_name)
+                if current < AUTO_TUNE_MAX_LEVEL:
+                    auto_tune_state["levels"][filter_name] = current + 1
+                    tuned.append(f"{filter_name}+{current + 1}")
+    elif recent_signals >= 2:
+        for filter_name, current in auto_tune_state["levels"].items():
+            if current > 0:
+                auto_tune_state["levels"][filter_name] = current - 1
+                decayed.append(f"{filter_name}-{current - 1}")
+    if tuned or decayed:
+        blocks_str = ", ".join([f"{k}:{v}" for k, v in blocks.items()]) if blocks else "none"
+        print(f"🧰 AutoTune: {', '.join(tuned + decayed)} | blocks={blocks_str} | signals_last_{AUTO_TUNE_SIGNAL_WINDOW_MIN}m={recent_signals}")
+        auto_tune_state["last_apply"] = now
+
+def record_block(reason: str):
+    if not ADAPTIVE_ENABLED:
+        return
+    if not reason:
+        return
+    adaptive_state["blocked_counts"][reason] += 1
+
+def get_adaptive_relax_level() -> int:
+    if not ADAPTIVE_ENABLED:
+        return 0
+    now = datetime.now(timezone.utc)
+    last_signal = adaptive_state.get("last_signal_time")
+    silence_sec = (now - last_signal).total_seconds() if last_signal else None
+    level = 0
+    if silence_sec is None or silence_sec >= 3 * 3600:
+        level = 3
+    elif silence_sec >= 90 * 60:
+        level = 2
+    elif silence_sec >= 45 * 60:
+        level = 1
+    # If flow is healthy, ease back
+    _prune_recent_signals(now, window_min=90)
+    recent_2h = len(adaptive_state["recent_signals"])
+    if recent_2h >= 3:
+        level = max(0, level - 1)
+    adaptive_state["last_relax_level"] = level
+    return level
+
+def get_adaptive_rsi_prefilter_thresholds() -> tuple:
+    level = get_effective_relax_level("RSI_1H_PREFILTER")
+    long_min = min(60, 40 + (level * 7))
+    short_max = max(40, 60 - (level * 7))
+    return long_min, short_max
+
+def get_adaptive_consolidation_thresholds() -> tuple:
+    level = get_effective_relax_level("CONSOLIDATION")
+    atr_thr = max(0.20, CONSOLIDATION_ATR_THRESHOLD - (0.05 * level))
+    range_edge = min(60, CONSOLIDATION_RANGE_EDGE_PCT + (5 * level))
+    momentum_min = max(15, CONSOLIDATION_MOMENTUM_MIN - (3 * level))
+    adx_min = max(10, CONSOLIDATION_ADX_MIN - (2 * level))
+    return atr_thr, range_edge, momentum_min, adx_min
+
+def adaptive_impulse_bypass_threshold() -> int:
+    level = get_adaptive_relax_level()
+    if level >= 3:
+        return 50
+    if level == 2:
+        return 60
+    if level == 1:
+        return 70
+    return 80
+
+def maybe_log_adaptive_status():
+    if not ADAPTIVE_ENABLED:
+        return
+    now = datetime.now(timezone.utc)
+    last_log = adaptive_state.get("last_log_time")
+    if last_log and (now - last_log).total_seconds() < ADAPTIVE_LOG_INTERVAL_MIN * 60:
+        return
+    relax_level = get_adaptive_relax_level()
+    top_blocks = adaptive_state["blocked_counts"].most_common(3)
+    blocks_str = ", ".join([f"{k}:{v}" for k, v in top_blocks]) if top_blocks else "none"
+    print(f"🧠 Adaptive status: relax={relax_level} | blocks={blocks_str}")
+    adaptive_state["last_log_time"] = now
+    maybe_apply_auto_tune()
+    adaptive_state["blocked_counts"].clear()
+
+# ================================
+# MARKET INTEL (structure analytics)
+# ================================
+MARKET_INTEL_REFRESH_INTERVAL = 1800  # seconds
+market_intel_engine = MarketIntelEngine()
+market_intel_results = {}
+market_intel_last_update = None
+
+def _load_market_intel_cache():
+    cache_path = os.path.join(os.path.dirname(__file__), "market_intel_cache.json")
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Market intel cache load error: {e}")
+        return None
+
+def _save_market_intel_cache(results, last_update):
+    cache_path = os.path.join(os.path.dirname(__file__), "market_intel_cache.json")
+    try:
+        payload = {
+            "assets": results,
+            "last_update": last_update.isoformat() if last_update else None
+        }
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+    except Exception as e:
+        print(f"Market intel cache save error: {e}")
+
+def run_market_intel_sync():
+    results = {}
+    for symbol in FUTURES_ASSETS:
+        df_1h = fetch_ohlcv_sync(symbol, TIMEFRAME_TREND, limit=120)
+        df_4h = fetch_ohlcv_sync(symbol, TIMEFRAME_MACRO, limit=120)
+        if df_1h is None or df_4h is None:
+            continue
+        analysis = market_intel_engine.analyze_asset(df_1h, df_4h)
+        results[symbol] = analysis
+    return results
+
+def mask_chat_id(chat_id: str) -> str:
+    if not chat_id:
+        return None
+    cid = str(chat_id)
+    if len(cid) <= 4:
+        return "*" * len(cid)
+    return f"{cid[:2]}***{cid[-2:]}"
+
+HEARTBEAT_INTERVAL = 7200  # 2 hours in seconds
 
 async def send_heartbeat():
     """Siųsti heartbeat žinutę į Telegram kas 1 val"""
@@ -706,17 +1626,30 @@ async def send_heartbeat():
     try:
         from telegram import Bot
         tg_bot = Bot(token=TELEGRAM_TOKEN)
-        await tg_bot.send_message(chat_id=CHAT_ID, text=message)
+        sent = await tg_bot.send_message(chat_id=CHAT_ID, text=message)
+        telegram_stats["last_send"] = now.isoformat()
+        telegram_stats["last_method"] = "heartbeat"
+        telegram_stats["last_message_id"] = getattr(sent, "message_id", None)
+        telegram_stats["last_error"] = None
+        telegram_stats["last_error_type"] = None
+        telegram_stats["last_chat_id_masked"] = mask_chat_id(CHAT_ID)
         bot_stats["last_heartbeat"] = now
         print(f"💚 Heartbeat sent at {now.strftime('%H:%M:%S')} UTC")
     except Exception as e:
         print(f"⚠️ Heartbeat send error: {e}")
+        telegram_stats["last_send"] = now.isoformat()
+        telegram_stats["last_method"] = "heartbeat"
+        telegram_stats["last_message_id"] = None
+        telegram_stats["last_error"] = str(e)
+        telegram_stats["last_error_type"] = type(e).__name__
+        telegram_stats["last_chat_id_masked"] = mask_chat_id(CHAT_ID)
         bot_stats["last_heartbeat"] = now  # Still update to prevent spam
 
 # ================================
 # WIN/LOSS TRACKING SYSTEM
 # ================================
 SIGNALS_FILE = "signal_results.json"
+STATE_FILE = "bot_state.json"  # State persistence file
 
 def load_signal_results():
     """Įkelti signalų rezultatus iš failo"""
@@ -735,6 +1668,72 @@ def save_signal_results(data):
             json.dump(data, f, indent=2, default=str)
     except Exception as e:
         print(f"Error saving signal results: {e}")
+
+def save_bot_state():
+    """Išsaugoti bot state (open_positions, auto_trading_state) į failą"""
+    global open_positions, auto_trading_state
+    try:
+        state = {
+            "open_positions": open_positions,
+            "auto_trading_state": auto_trading_state,
+            "saved_at": datetime.now(timezone.utc).isoformat()
+        }
+        # Convert datetime objects to strings
+        def convert_datetime(obj):
+            if isinstance(obj, dict):
+                return {k: convert_datetime(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_datetime(item) for item in obj]
+            elif isinstance(obj, datetime):
+                return obj.isoformat()
+            return obj
+        
+        state = convert_datetime(state)
+        
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+        return True
+    except Exception as e:
+        print(f"⚠️ Error saving bot state: {e}")
+        return False
+
+def load_bot_state():
+    """Įkelti bot state iš failo"""
+    global open_positions, auto_trading_state
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+            
+            # Restore auto_trading_state
+            if 'auto_trading_state' in state:
+                saved_state = state['auto_trading_state']
+                for key in auto_trading_state:
+                    if key in saved_state:
+                        auto_trading_state[key] = saved_state[key]
+            
+            # Restore open_positions (convert datetime strings back)
+            if 'open_positions' in state:
+                saved_positions = state['open_positions']
+                for symbol, pos_data in saved_positions.items():
+                    # Convert datetime strings back to datetime objects
+                    for key, value in pos_data.items():
+                        if isinstance(value, str) and ('time' in key.lower() or 'date' in key.lower()):
+                            try:
+                                pos_data[key] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                            except:
+                                pass
+                    open_positions[symbol] = pos_data
+            
+            saved_at = state.get('saved_at', 'unknown')
+            print(f"✅ Loaded bot state from {saved_at}")
+            print(f"   - Open positions: {len(open_positions)}")
+            print(f"   - Daily P&L: ${auto_trading_state.get('daily_pnl', 0):.2f}")
+            print(f"   - Weekly P&L: ${auto_trading_state.get('weekly_pnl', 0):.2f}")
+            return True
+    except Exception as e:
+        print(f"⚠️ Error loading bot state: {e}")
+    return False
 
 def mark_signal_result(signal_id: str, result: str, profit_pct: float = 0.0):
     """
@@ -823,6 +1822,57 @@ def get_win_rate():
         "total_signals": total_signals
     }
 
+def get_recent_trades(strategy_name, limit=20):
+    """
+    Get recent completed trades for a specific strategy (rolling statistics)
+    
+    Args:
+        strategy_name: Strategy name from STRATEGY_LIST
+        limit: Maximum number of recent trades to return (default: 20)
+    
+    Returns:
+        List of recent trades (most recent last)
+    """
+    data = load_signal_results()
+    trades = [
+        s for s in data["signals"]
+        if s.get("strategy") == strategy_name and s.get("result") in ("WIN", "LOSS")
+    ]
+    return trades[-limit:]
+
+def calculate_metrics(trades):
+    """
+    Calculate trading metrics from a list of trades
+    
+    Args:
+        trades: List of trade dictionaries with "result" and "profit_pct" fields
+    
+    Returns:
+        Tuple of (win_rate, expectancy, consecutive_losses) or None if no trades
+    """
+    if not trades:
+        return None
+
+    wins = sum(1 for t in trades if t["result"] == "WIN")
+    losses = len(trades) - wins
+    win_rate = wins / len(trades)
+
+    avg_profit = sum(t["profit_pct"] for t in trades) / len(trades)
+    avg_loss = abs(sum(t["profit_pct"] for t in trades if t["profit_pct"] < 0) / max(1, losses))
+
+    rr = avg_profit / avg_loss if avg_loss > 0 else 1.0
+    expectancy = win_rate * rr - (1 - win_rate)
+
+    # consecutive losses
+    cons_losses = 0
+    for t in reversed(trades):
+        if t["result"] == "LOSS":
+            cons_losses += 1
+        else:
+            break
+
+    return win_rate, expectancy, cons_losses
+
 def record_trade_result(symbol: str, direction: str, result: str, profit_pct: float, is_counter_trend: bool = False):
     """
     Record trade result when position is closed (used by sync function)
@@ -880,7 +1930,8 @@ def add_signal_to_tracking(signal: dict):
         "result": None,
         "profit_pct": None,
         "marked_at": None,
-        "is_counter_trend": is_counter_trend  # v8.9.4: Track CT signals
+        "is_counter_trend": is_counter_trend,  # v8.9.4: Track CT signals
+        "strategy": signal.get("strategy_name", "TREND_CONTINUATION")  # Strategy identification
     }
     
     data["signals"].append(tracked_signal)
@@ -898,13 +1949,40 @@ bot_stats["wins"] = _saved_results["stats"].get("wins", 0)
 bot_stats["losses"] = _saved_results["stats"].get("losses", 0)
 bot_stats["total_profit_pct"] = _saved_results["stats"].get("total_profit_pct", 0.0)
 
-quant_engine = QuantAnalytics()
+quant_engine = QuantAnalytics() if QUANT_ENABLED else None
 quant_results = {}
 quant_correlation = None
 quant_last_update = None
 
+# Strategy Health Engine
+strategy_health_engine = StrategyHealthEngine()
+
+# Bear Market Engine
+bear_config = BearMarketConfig(
+    ENABLED=True,
+    AUTO_DETECT=not BEAR_MARKET["OVERRIDE_AUTO_DETECT"]
+)
+bear_engine = BearMarketEngine(bear_config)
+if BEAR_MARKET["MANUAL_OVERRIDE_LOCK"]:
+    bear_engine.detector.set_manual_override(True, BEAR_MARKET["STRENGTH"])
+if BEAR_MARKET["FORCE_ACTIVATE"]:
+    bear_engine.detector.set_manual_override(True, BEAR_MARKET["STRENGTH"])
+    print("🔥 BEAR MARKET MANUALLY OVERRIDDEN")
+bear_last_update = None
+BEAR_MARKET_UPDATE_INTERVAL = 6 * 3600  # seconds
+
+# HTF structure lock
+direction_lock = DirectionLock()
+mode_router = ModeRouter()
+mode_router.register("CASHFLOW", cashflow_process_signal)
+mode_router.register("SWING", swing_process_signal)
+htf_last_update = None
+htf_last_candle_time = None
+htf_state = {"bos": None, "lock": None, "choch": None}
+
 # Position tracking for trailing stop
 open_positions = {}  # symbol -> position_data
+position_lock = asyncio.Lock()  # Lock for thread-safe position operations
 
 # Disabled assets (PWA control) - v8.9.18
 disabled_assets = set()  # Assets to skip during analysis
@@ -945,11 +2023,94 @@ circuit_state = {
     "is_paused": False,
     "pause_reason": None,
     "last_signal_result": None,
+    "cooldown_until": None,
 }
 
 # Risk Events Log (v8.9.18)
 risk_events_log = []  # List of risk events for analytics
 MAX_RISK_EVENTS = 100  # Keep last 100 events
+
+# Critical Alert Deduplication (prevent spam)
+critical_alerts_sent = {}  # event_type -> last_sent_timestamp
+CRITICAL_ALERT_COOLDOWN = RISK["CRITICAL_ALERT_COOLDOWN"]  # 1 hour cooldown between same alert type
+
+# Entry Timing State Tracking (WAIT → ARM → ENTER)
+entry_timing_states = {}  # symbol -> {"state": "WAIT"/"ARM"/"ENTER", "distance_pct": float, "last_check": datetime}
+zone_wait_status = {}  # symbol -> {"state": str, "last_sent": datetime}
+zone_close_states = {}  # key -> {"state": ZoneInteraction, "break_candle": dict, "break_time": datetime}
+ZONE_WAIT_STATUS_COOLDOWN_MIN = 30
+pullback_impulse_states = {}  # symbol -> "NO_IMPULSE"/"HOT"/"COOLING"
+
+
+async def send_telegram_critical_alert(event_type: str, details: str, event_data: dict = None):
+    """
+    Send critical alert to Telegram with deduplication.
+    Prevents spam by only sending same alert type once per cooldown period.
+    """
+    global critical_alerts_sent
+    
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    
+    # Check cooldown
+    now = datetime.now(timezone.utc)
+    last_sent = critical_alerts_sent.get(event_type)
+    
+    if last_sent:
+        time_since_last = (now - last_sent).total_seconds()
+        if time_since_last < CRITICAL_ALERT_COOLDOWN:
+            # Still in cooldown, skip
+            return
+    
+    try:
+        # Build alert message
+        emoji_map = {
+            "BALANCE_FETCH_FAILED": "🚫",
+            "API_TIMEOUT": "⏱️",
+            "DAILY_LIMIT": "🔴",
+            "WEEKLY_LIMIT": "🔴",
+            "FUND_FLOW_ERROR": "⚠️",
+            "API_KEY_ERROR": "🔑",
+            "MAX_DRAWDOWN": "📉",
+        }
+        
+        emoji = emoji_map.get(event_type, "⚠️")
+        
+        # Get additional context
+        balance = get_available_balance()
+        capital = balance.get("total_usd", 0)
+        daily_pnl = auto_trading_state.get("daily_pnl", 0)
+        weekly_pnl = auto_trading_state.get("weekly_pnl", 0)
+        open_pos_count = len([p for p in open_positions.values() if p])
+        
+        message = f"""{emoji} <b>CRITICAL ALERT</b> {emoji}
+
+🔴 <b>{event_type}</b>
+
+📝 <b>Details:</b>
+{details}
+
+💰 <b>Current Status:</b>
+Capital: ${capital:.2f}
+Daily P&L: ${daily_pnl:+.2f}
+Weekly P&L: ${weekly_pnl:+.2f}
+Open Positions: {open_pos_count}
+
+⏰ {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+<i>This is a critical system alert. Please review immediately.</i>"""
+        
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+        
+        # Update last sent timestamp
+        critical_alerts_sent[event_type] = now
+        
+        print(f"📱 Telegram critical alert sent: {event_type}")
+        
+    except Exception as e:
+        print(f"⚠️ Failed to send Telegram critical alert: {e}")
+
 
 def log_risk_event(event_type, details, severity="warning"):
     """
@@ -958,12 +2119,18 @@ def log_risk_event(event_type, details, severity="warning"):
     severity: "info", "warning", "critical"
     """
     global risk_events_log
+    try:
+        balance_snapshot = get_available_balance()
+        capital_at_event = balance_snapshot.get("total_usd", 0)
+    except Exception:
+        capital_at_event = 0
+    
     event = {
         "type": event_type,
         "details": details,
         "severity": severity,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "capital_at_event": get_available_balance().get("total_usd", 0),
+        "capital_at_event": capital_at_event,
         "daily_pnl": auto_trading_state.get("daily_pnl", 0),
         "weekly_pnl": auto_trading_state.get("weekly_pnl", 0),
         "consecutive_losses": circuit_state.get("consecutive_losses", 0),
@@ -975,6 +2142,91 @@ def log_risk_event(event_type, details, severity="warning"):
         risk_events_log = risk_events_log[-MAX_RISK_EVENTS:]
     
     print(f"⚠️ RISK EVENT: {event_type} - {details} (severity: {severity})")
+    
+    # Send Telegram alert for critical events
+    if severity == "critical":
+        # Schedule async Telegram alert (non-blocking)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Event loop is running - create task
+                asyncio.create_task(send_telegram_critical_alert(event_type, details, event))
+            else:
+                # No event loop running - will be sent when loop starts
+                pass  # Will be handled when async context is available
+        except RuntimeError:
+            # No event loop available - will be sent when async context is available
+            pass
+
+
+async def send_telegram_critical_alert(event_type: str, details: str, event_data: dict = None):
+    """
+    Send critical alert to Telegram with deduplication.
+    Prevents spam by only sending same alert type once per cooldown period.
+    """
+    global critical_alerts_sent
+    
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    
+    # Check cooldown
+    now = datetime.now(timezone.utc)
+    last_sent = critical_alerts_sent.get(event_type)
+    
+    if last_sent:
+        time_since_last = (now - last_sent).total_seconds()
+        if time_since_last < CRITICAL_ALERT_COOLDOWN:
+            # Still in cooldown, skip
+            return
+    
+    try:
+        # Build alert message
+        emoji_map = {
+            "BALANCE_FETCH_FAILED": "🚫",
+            "API_TIMEOUT": "⏱️",
+            "DAILY_LIMIT": "🔴",
+            "WEEKLY_LIMIT": "🔴",
+            "FUND_FLOW_ERROR": "⚠️",
+            "API_KEY_ERROR": "🔑",
+            "MAX_DRAWDOWN": "📉",
+        }
+        
+        emoji = emoji_map.get(event_type, "⚠️")
+        
+        # Get additional context
+        balance = get_available_balance()
+        capital = balance.get("total_usd", 0)
+        daily_pnl = auto_trading_state.get("daily_pnl", 0)
+        weekly_pnl = auto_trading_state.get("weekly_pnl", 0)
+        open_pos_count = len([p for p in open_positions.values() if p])
+        
+        message = f"""{emoji} <b>CRITICAL ALERT</b> {emoji}
+
+🔴 <b>{event_type}</b>
+
+📝 <b>Details:</b>
+{details}
+
+💰 <b>Current Status:</b>
+Capital: ${capital:.2f}
+Daily P&L: ${daily_pnl:+.2f}
+Weekly P&L: ${weekly_pnl:+.2f}
+Open Positions: {open_pos_count}
+
+⏰ {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+<i>This is a critical system alert. Please review immediately.</i>"""
+        
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+        
+        # Update last sent timestamp
+        critical_alerts_sent[event_type] = now
+        
+        print(f"📱 Telegram critical alert sent: {event_type}")
+        
+    except Exception as e:
+        print(f"⚠️ Failed to send Telegram critical alert: {e}")
 
 # FOMC State
 fomc_alert_sent = set()
@@ -984,6 +2236,8 @@ kraken_positions = {
     "positions": {},  # symbol -> {"direction": "LONG"/"SHORT", "size": float}
     "last_fetch": None,
     "fetch_interval": 30,  # seconds between API calls
+    "fetch_failed": False,
+    "consecutive_failures": 0,
 }
 
 # Auto-Trading State (v8.6 + v8.9.18 weekly tracking)
@@ -1000,7 +2254,9 @@ auto_trading_state = {
     "last_weekly_reset": None,  # Last weekly reset time (Monday UTC)
     "is_paused": False,         # Paused due to loss limit
     "pause_reason": None,
-    "pause_type": None,         # "DAILY" or "WEEKLY"
+    "pause_type": None,         # "DAILY", "WEEKLY", or "MAX_DRAWDOWN"
+    "peak_equity": 0.0,         # Highest equity ever reached (v8.9.25 - Max Drawdown)
+    "peak_equity_date": None,   # Date when peak equity was reached
 }
 
 # ================================
@@ -1069,40 +2325,47 @@ def determine_leverage(signal_score, ml_confidence=None, confirmation_count=0, s
     # Position Size = Risk / SL%
     max_position_by_risk = MAX_RISK_PER_TRADE_USD / effective_sl_pct
     
+    eur_usd_rate = get_eur_usd_rate()
+    max_margin_usd_from_eur = MAX_MARGIN_EUR * eur_usd_rate
+    effective_margin_usd = min(AUTO_TRADE_MARGIN_USD, MAX_MARGIN_USD, max_margin_usd_from_eur)
+    
     # Calculate position size based on tier leverage and margin
-    tier_position_size = AUTO_TRADE_MARGIN_USD * tier_leverage
+    tier_position_size = effective_margin_usd * tier_leverage
     
     # Use SMALLER of the two (risk-capped)
     if max_position_by_risk < tier_position_size:
         position_size_usd = max_position_by_risk
         risk_adjusted = True
         # Recalculate effective leverage
-        selected_leverage = max(1, min(10, int(position_size_usd / AUTO_TRADE_MARGIN_USD)))
+        selected_leverage = max(1, min(MAX_LEVERAGE, int(position_size_usd / effective_margin_usd)))
         tier_reason.append(f"🛡️ Risk-sized: ${position_size_usd:.0f} (SL {effective_sl_pct*100:.1f}%)")
     else:
         position_size_usd = tier_position_size
         selected_leverage = tier_leverage
     
     # Calculate actual margin (collateral) needed
-    margin_usd = position_size_usd / selected_leverage if selected_leverage > 0 else AUTO_TRADE_MARGIN_USD
+    margin_usd = position_size_usd / selected_leverage if selected_leverage > 0 else effective_margin_usd
     
     # Hard caps for safety
-    # Max position: $250 (10x leverage on $25)
+    # Max position: 5x leverage on EUR-capped margin
     # Min position: $10 (too small = high fee impact)
     MAX_POSITION_USD = 250
     MIN_POSITION_USD = 10
+    max_position_by_eur = max_margin_usd_from_eur * MAX_LEVERAGE
+    max_position_by_usd = MAX_MARGIN_USD * MAX_LEVERAGE
+    hard_max_position_usd = min(MAX_POSITION_USD, max_position_by_eur, max_position_by_usd)
     
-    if position_size_usd > MAX_POSITION_USD:
-        position_size_usd = MAX_POSITION_USD
-        tier_reason.append(f"Capped at ${MAX_POSITION_USD}")
+    if position_size_usd > hard_max_position_usd:
+        position_size_usd = hard_max_position_usd
+        tier_reason.append(f"Capped at ${hard_max_position_usd:.0f} (EUR cap)")
     
     if position_size_usd < MIN_POSITION_USD:
         position_size_usd = MIN_POSITION_USD
         tier_reason.append(f"Min size ${MIN_POSITION_USD}")
     
     # Recalculate leverage based on final position
-    selected_leverage = max(1, min(10, int(position_size_usd / AUTO_TRADE_MARGIN_USD)))
-    margin_usd = min(AUTO_TRADE_MARGIN_USD, position_size_usd / selected_leverage) if selected_leverage > 0 else AUTO_TRADE_MARGIN_USD
+    selected_leverage = max(1, min(MAX_LEVERAGE, int(position_size_usd / effective_margin_usd)))
+    margin_usd = min(effective_margin_usd, position_size_usd / selected_leverage) if selected_leverage > 0 else effective_margin_usd
     
     # Calculate actual risk for this trade
     actual_risk = position_size_usd * effective_sl_pct
@@ -1119,6 +2382,138 @@ def determine_leverage(signal_score, ml_confidence=None, confirmation_count=0, s
         "actual_risk_usd": actual_risk,
         "sl_pct": effective_sl_pct
     }
+
+# ================================
+# SAFE EXCHANGE API WRAPPER (with timeout)
+# ================================
+async def safe_exchange_call(func, *args, timeout=10, max_retries=3, **kwargs):
+    """
+    Wrapper for exchange API calls with timeout and retry logic.
+    Prevents bot from hanging indefinitely on API failures.
+    """
+    for attempt in range(max_retries):
+        try:
+            # Use asyncio.wait_for for timeout
+            if asyncio.iscoroutinefunction(func):
+                result = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+            else:
+                # Synchronous function - run in executor
+                loop = asyncio.get_event_loop()
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: func(*args, **kwargs)),
+                    timeout=timeout
+                )
+            return result
+        except asyncio.TimeoutError:
+            # Only log as critical on final attempt (after all retries failed)
+            if attempt == max_retries - 1:
+                log_risk_event("API_TIMEOUT", f"{func.__name__} timed out after {max_retries} attempts - operation failed", "critical")
+                raise
+            else:
+                # Log as warning for intermediate timeouts
+                log_risk_event("API_TIMEOUT", f"{func.__name__} timed out (attempt {attempt+1}/{max_retries}) - retrying...", "warning")
+            await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(0.5 * (attempt + 1))
+    return None
+
+# ================================
+# MAXIMUM DRAWDOWN PROTECTION (v8.9.25)
+# ================================
+def update_peak_equity(current_equity: float):
+    """
+    Update peak equity if current equity exceeds previous peak.
+    Peak equity is the highest equity ever reached (used for drawdown calculation).
+    """
+    global auto_trading_state
+    
+    if current_equity <= 0:
+        return
+    
+    peak = auto_trading_state.get("peak_equity", 0.0)
+    
+    # Update peak if current equity is higher
+    if current_equity > peak:
+        auto_trading_state["peak_equity"] = current_equity
+        auto_trading_state["peak_equity_date"] = datetime.now(timezone.utc).isoformat()
+        print(f"📈 New peak equity: ${current_equity:.2f}")
+
+def check_max_drawdown(current_equity: float) -> Tuple[bool, str, float]:
+    """
+    Check if maximum drawdown limit is reached.
+    
+    Args:
+        current_equity: Current total equity (capital + unrealized P&L)
+    
+    Returns:
+        tuple: (is_paused, reason, drawdown_pct)
+    """
+    global auto_trading_state
+    
+    peak = auto_trading_state.get("peak_equity", 0.0)
+    
+    # If no peak set yet, set current equity as peak
+    if peak == 0.0 and current_equity > 0:
+        auto_trading_state["peak_equity"] = current_equity
+        auto_trading_state["peak_equity_date"] = datetime.now(timezone.utc).isoformat()
+        return False, "", 0.0
+    
+    if peak <= 0:
+        return False, "", 0.0
+    
+    # Calculate drawdown from peak
+    drawdown_usd = peak - current_equity
+    drawdown_pct = (drawdown_usd / peak) * 100 if peak > 0 else 0.0
+    
+    # Check if drawdown limit reached
+    if drawdown_pct >= MAX_DRAWDOWN_PCT:
+        return True, f"Max drawdown -{MAX_DRAWDOWN_PCT:.1f}% reached (from ${peak:.2f} to ${current_equity:.2f}, -{drawdown_pct:.2f}%)", drawdown_pct
+    
+    return False, "", drawdown_pct
+
+def get_current_equity() -> float:
+    """
+    Calculate current total equity (capital + unrealized P&L from open positions).
+    
+    Returns:
+        Current total equity in USD
+    """
+    balance = get_available_balance()
+    capital = balance.get("total_usd", 0)
+    
+    # Add unrealized P&L from open positions
+    unrealized_pnl = 0.0
+    try:
+        # Get Kraken positions for accurate P&L
+        if POSITION_TRACKING_ENABLED and kraken_positions.get('positions'):
+            for symbol, pos in kraken_positions['positions'].items():
+                if not pos:
+                    continue
+                # Use unrealized_pnl from Kraken if available
+                if 'unrealized_pnl' in pos:
+                    unrealized_pnl += pos.get('unrealized_pnl', 0)
+                else:
+                    # Fallback: calculate from open_positions tracking
+                    if symbol in open_positions:
+                        tracked_pos = open_positions[symbol]
+                        entry_price = tracked_pos.get('entry_price', 0)
+                        direction = tracked_pos.get('direction', 'LONG')
+                        contracts = tracked_pos.get('size', 0)
+                        current_price = tracked_pos.get('current_price', entry_price)
+                        
+                        if entry_price > 0 and contracts > 0:
+                            if direction == "LONG":
+                                pnl = (current_price - entry_price) * contracts
+                            else:
+                                pnl = (entry_price - current_price) * contracts
+                            unrealized_pnl += pnl
+    except Exception as e:
+        # Silently fail - use capital only
+        pass
+    
+    return capital + unrealized_pnl
 
 # ================================
 # AUTO-TRADING FUNCTIONS (v8.6)
@@ -1143,9 +2538,24 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
     
     if not AUTO_TRADING_ENABLED:
         return {"success": False, "reason": "AUTO_TRADING_DISABLED"}
+
+    allowed, reason = sunday_engine.is_sunday_trading_time()
+    if not allowed:
+        return {"success": False, "reason": f"SUNDAY_BLOCK: {reason}"}
+
+    if PROFIT_MODE_ENABLED:
+        should_trade, trade_reason = profit_tracker.should_trade_more()
+        if not should_trade:
+            print(f"  ⏸️ PROFIT MODE: Skipping trade - {trade_reason}")
+            return {"success": False, "reason": f"PROFIT_MODE_STOP: {trade_reason}"}
     
     if not POSITION_TRACKING_ENABLED:
         return {"success": False, "reason": "NO_API_KEYS"}
+    
+    # Circuit breaker (cooldown / consecutive losses)
+    is_paused, pause_reason = check_circuit_breaker()
+    if is_paused:
+        return {"success": False, "reason": f"CIRCUIT_BREAKER: {pause_reason}"}
     
     # Check risk limits (v8.9.18 - percentage based)
     if auto_trading_state['is_paused']:
@@ -1157,8 +2567,29 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
         print(f"  🚫 FAIL-CLOSED: Balance fetch failed {balance['consecutive_failures']}x - trading halted")
         log_risk_event("BALANCE_FETCH_FAILED", f"Balance unknown after {balance['consecutive_failures']} failures - trading halted", "critical")
         return {"success": False, "reason": "BALANCE_UNKNOWN_FAIL_CLOSED"}
+    if balance.get("total_usd", 0) <= 0:
+        auto_trading_state['is_paused'] = True
+        auto_trading_state['pause_type'] = "EMERGENCY"
+        auto_trading_state['pause_reason'] = "BALANCE_ZERO_OR_UNKNOWN"
+        log_risk_event("BALANCE_ZERO", "Balance is zero or unavailable - trading halted", "critical")
+        return {"success": False, "reason": "BALANCE_ZERO_OR_UNKNOWN"}
     
     capital = balance.get("total_usd", 0)
+    
+    # v8.9.25: Maximum Drawdown Protection - Check BEFORE other limits
+    current_equity = get_current_equity()
+    update_peak_equity(current_equity)  # Update peak if new high reached
+    
+    is_drawdown_paused, drawdown_reason, drawdown_pct = check_max_drawdown(current_equity)
+    if is_drawdown_paused:
+        if auto_trading_state['pause_type'] != "MAX_DRAWDOWN":
+            # Only log and alert if this is a new drawdown pause
+            auto_trading_state['is_paused'] = True
+            auto_trading_state['pause_type'] = "MAX_DRAWDOWN"
+            auto_trading_state['pause_reason'] = drawdown_reason
+            log_risk_event("MAX_DRAWDOWN", drawdown_reason, "critical")
+            print(f"  📉 MAX_DRAWDOWN: {drawdown_reason}")
+        return {"success": False, "reason": "MAX_DRAWDOWN_LIMIT"}
     
     if capital > 0:
         # Percentage-based limits
@@ -1192,6 +2623,12 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
     # Check max positions - FORCE fresh fetch (no cache) to prevent duplicates
     kraken_positions['last_fetch'] = None  # Clear cache
     await fetch_kraken_positions()
+    if kraken_positions.get("fetch_failed") and kraken_positions.get("consecutive_failures", 0) >= 2:
+        auto_trading_state['is_paused'] = True
+        auto_trading_state['pause_type'] = "EMERGENCY"
+        auto_trading_state['pause_reason'] = "POSITION_FETCH_FAILED"
+        log_risk_event("POSITION_FETCH_FAILED", "Could not fetch Kraken positions - trading halted", "critical")
+        return {"success": False, "reason": "POSITION_FETCH_FAILED"}
     current_positions = len(kraken_positions['positions'])
     if current_positions >= AUTO_TRADE_MAX_POSITIONS:
         return {"success": False, "reason": f"MAX_POSITIONS ({AUTO_TRADE_MAX_POSITIONS})"}
@@ -1215,6 +2652,20 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
     if signal_score < AUTO_TRADE_MIN_SCORE:
         return {"success": False, "reason": f"SCORE_TOO_LOW ({signal_score} < {AUTO_TRADE_MIN_SCORE})"}
     
+    # ================================
+    # STRATEGY HEALTH CHECK (CRITICAL)
+    # ================================
+    # Note: Health check is done in signal generation, but verify here as well
+    strategy_name = kwargs.get('strategy_name', 'TREND_CONTINUATION')
+    size_multiplier = kwargs.get('size_multiplier', 1.0)
+    
+    # Double-check health (defense in depth)
+    health = strategy_health_engine.evaluate_strategy(strategy_name)
+    
+    if health.status == "DISABLED":
+        print(f"  🚫 STRATEGY HEALTH: {strategy_name} is DISABLED - {health.reason}")
+        return {"success": False, "reason": f"STRATEGY_DISABLED: {health.reason}"}
+    
     try:
         # Calculate stop loss percentage for risk budget
         if direction == "LONG":
@@ -1234,6 +2685,14 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
         leverage_tier = leverage_result['tier']
         position_size_usd = leverage_result['position_size_usd']
         
+        # Apply size multiplier from signal generation (Strategy Health + Rebound restrictions)
+        if size_multiplier != 1.0:
+            original_size = position_size_usd
+            position_size_usd *= size_multiplier
+            print(f"  ⚠️ SIZE MULTIPLIER: Position reduced ${original_size:.0f} → ${position_size_usd:.0f} ({size_multiplier:.0%})")
+            if health.status == "WARNING":
+                print(f"     Reason: Strategy {strategy_name} is WARNING - {health.reason}")
+        
         # v8.9.23: Apply SCALP_REBOUND size multiplier if active
         scalp_rebound_multiplier = kwargs.get('scalp_rebound_multiplier', 1.0)
         if scalp_rebound_multiplier < 1.0:
@@ -1241,15 +2700,43 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
             position_size_usd = position_size_usd * scalp_rebound_multiplier
             print(f"     🔄 SCALP_REBOUND: Position reduced ${original_size:.0f} → ${position_size_usd:.0f} ({scalp_rebound_multiplier:.0%})")
         
+        # Apply risk modifier from 4H trend context (CASHFLOW BOT)
+        risk_modifier = kwargs.get('risk_modifier', 1.0)
+        if risk_modifier < 1.0:
+            original_size = position_size_usd
+            position_size_usd = position_size_usd * risk_modifier
+            print(f"     📊 4H RISK MODIFIER: Position reduced ${original_size:.0f} → ${position_size_usd:.0f} ({risk_modifier:.0%})")
+
+        if PROFIT_MODE_ENABLED:
+            profit_multiplier = profit_tracker.get_position_multiplier()
+            if profit_multiplier != 1.0:
+                original_size = position_size_usd
+                position_size_usd = position_size_usd * profit_multiplier
+                print(f"     💰 PROFIT MODE: Position adjusted ${original_size:.0f} → ${position_size_usd:.0f} ({profit_multiplier:.2f}x)")
+        
         # Calculate position size in contracts
         position_size = position_size_usd / price
+
+        sunday_adjusted = sunday_engine.adjust_for_sunday({
+            "position_size": position_size,
+            "leverage": selected_leverage
+        })
+        position_size = sunday_adjusted.get("position_size", position_size)
+        selected_leverage = int(sunday_adjusted.get("leverage", selected_leverage))
+
+        if PROFIT_MODE_ENABLED and tp1 and price > 0:
+            expected_profit_usd = abs(tp1 - price) * position_size
+            expected_profit_eur = expected_profit_usd * get_usd_eur_rate()
+            if expected_profit_eur < MIN_PROFIT_PER_TRADE_EUR:
+                print(f"  ⏸️ PROFIT MODE: TP1 profit too small ({expected_profit_eur:.2f}€ < {MIN_PROFIT_PER_TRADE_EUR}€)")
+                return {"success": False, "reason": "PROFIT_MODE_MIN_PROFIT"}
         
         # Determine order side
         side = "buy" if direction == "LONG" else "sell"
         
         # v8.9.6: Set leverage BEFORE placing order (Kraken uses account-level leverage)
         try:
-            exchange.set_leverage(selected_leverage, symbol)
+            await safe_exchange_call(exchange.set_leverage, selected_leverage, symbol, timeout=5)
             print(f"     Leverage set to {selected_leverage}x for {symbol}")
         except Exception as lev_err:
             print(f"     ⚠️ Could not set leverage: {lev_err}")
@@ -1297,35 +2784,112 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
                 # Store order ID for tracking
                 kwargs['limit_order_id'] = order_id
                 kwargs['limit_order_pending'] = True
-                # For now, we'll wait a bit and check again
-                import time
-                max_wait = 30  # Wait up to 30 seconds for limit order
-                for i in range(6):  # Check every 5 seconds
-                    time.sleep(5)
+                
+                limit_price = price
+                max_wait = LIMIT_ORDER_WAIT_SECONDS
+                poll_interval = LIMIT_CHASE_INTERVAL_SECONDS
+                max_steps = max(1, LIMIT_CHASE_MAX_STEPS)
+                total_wait = 0
+                
+                for i in range(max_steps):
+                    await asyncio.sleep(poll_interval)
+                    total_wait += poll_interval
                     try:
-                        order_check = exchange.fetch_order(order_id, symbol)
+                        order_check = await safe_exchange_call(exchange.fetch_order, order_id, symbol, timeout=5)
+                        if order_check is None:
+                            print(f"     ⚠️ Order check timeout")
+                            continue
                         order_status = order_check.get('status', 'unknown')
                         filled_amount = order_check.get('filled', 0) or 0
                         actual_entry_price = order_check.get('average', price) or price
                         
                         if order_status in ['closed', 'filled']:
-                            print(f"     ✅ LIMIT order filled @ ${actual_entry_price:.2f} after {(i+1)*5}s")
+                            print(f"     ✅ LIMIT order filled @ ${actual_entry_price:.2f} after {total_wait}s")
                             position_size = filled_amount
                             break
                         elif order_status == 'canceled':
                             return {"success": False, "reason": "LIMIT_ORDER_CANCELED"}
-                        else:
-                            print(f"     ⏳ Still waiting... ({(i+1)*5}s)")
+                        
+                        # Chase price if still open
+                        if order_status == 'open':
+                            try:
+                                ticker = await safe_exchange_call(exchange.fetch_ticker, symbol, timeout=5)
+                                last_price = None
+                                if ticker:
+                                    last_price = ticker.get('last') or ticker.get('mark') or ticker.get('close')
+                                
+                                if last_price:
+                                    if direction == "LONG":
+                                        chase_price = last_price * (1 + LIMIT_CHASE_STEP_PCT / 100)
+                                        max_price = price * (1 + LIMIT_MAX_SLIPPAGE_PCT / 100)
+                                        new_limit_price = min(chase_price, max_price)
+                                    else:
+                                        chase_price = last_price * (1 - LIMIT_CHASE_STEP_PCT / 100)
+                                        min_price = price * (1 - LIMIT_MAX_SLIPPAGE_PCT / 100)
+                                        new_limit_price = max(chase_price, min_price)
+                                    
+                                    if abs(new_limit_price - limit_price) / limit_price * 100 >= 0.03:
+                                        await safe_exchange_call(exchange.cancel_order, order_id, symbol, timeout=5)
+                                        order = exchange.create_order(
+                                            symbol=symbol,
+                                            type='limit',
+                                            side=side,
+                                            amount=position_size,
+                                            price=new_limit_price
+                                        )
+                                        order_id = order.get('id')
+                                        limit_price = new_limit_price
+                                        print(f"     🎯 LIMIT chase #{i+1}: ${limit_price:.2f}")
+                            except Exception as e:
+                                print(f"     ⚠️ Chase error: {e}")
+                        
+                        if total_wait >= max_wait:
+                            break
                     except Exception as e:
                         print(f"     ⚠️ Check error: {e}")
-                else:
-                    # Timeout - cancel and abort
-                    print(f"     ⏰ LIMIT order timeout after {max_wait}s - cancelling")
+                
+                if order_status not in ['closed', 'filled']:
+                    # Timeout - cancel order
+                    print(f"     ⏰ LIMIT order timeout after {total_wait}s - cancelling")
                     try:
-                        exchange.cancel_order(order_id, symbol)
+                        await safe_exchange_call(exchange.cancel_order, order_id, symbol, timeout=5)
                     except:
                         pass
-                    return {"success": False, "reason": "LIMIT_ORDER_TIMEOUT"}
+                    
+                    allow_fallback = (
+                        LIMIT_FALLBACK_TO_MARKET
+                        and leverage_tier == "STRONG"
+                        and signal_score >= LIMIT_FALLBACK_MIN_SCORE
+                    )
+                    
+                    if allow_fallback:
+                        print(f"     ⚡ LIMIT fallback → MARKET (score {signal_score}, tier {leverage_tier})")
+                        order = exchange.create_order(
+                            symbol=symbol,
+                            type='market',
+                            side=side,
+                            amount=position_size
+                        )
+                        order_id = order.get('id')
+                        order_status = order.get('status', 'unknown')
+                        filled_amount = order.get('filled', 0) or 0
+                        actual_entry_price = order.get('average', price) or price
+                        
+                        if order_status not in ['closed', 'filled'] or filled_amount < position_size * 0.5:
+                            try:
+                                await asyncio.sleep(1)
+                                order_check = await safe_exchange_call(exchange.fetch_order, order_id, symbol, timeout=5)
+                                if order_check:
+                                    order_status = order_check.get('status', 'unknown')
+                                    filled_amount = order_check.get('filled', 0) or 0
+                                    actual_entry_price = order_check.get('average', price) or price
+                            except Exception as verify_err:
+                                print(f"     ⚠️ Market fallback verify error: {verify_err}")
+                            
+                            if order_status not in ['closed', 'filled'] or filled_amount < position_size * 0.5:
+                                return {"success": False, "reason": f"LIMIT_FALLBACK_NOT_FILLED: {order_status}"}
+                    else:
+                        return {"success": False, "reason": "LIMIT_ORDER_TIMEOUT"}
             else:
                 # Unknown status
                 print(f"     ⚠️ LIMIT order status: {order_status}")
@@ -1338,9 +2902,11 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
                 
                 # Try to fetch order status
                 try:
-                    import time
-                    time.sleep(1)  # Wait for exchange to process
-                    order_check = exchange.fetch_order(order_id, symbol)
+                    await asyncio.sleep(1)  # Wait for exchange to process
+                    order_check = await safe_exchange_call(exchange.fetch_order, order_id, symbol, timeout=5)
+                    if order_check is None:
+                        print(f"     ⚠️ Order verification timeout - assuming failed")
+                        return {"success": False, "reason": "ORDER_VERIFICATION_TIMEOUT"}
                     order_status = order_check.get('status', 'unknown')
                     filled_amount = order_check.get('filled', 0) or 0
                     actual_entry_price = order_check.get('average', price) or price
@@ -1349,7 +2915,7 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
                         # Order failed or partially filled - cancel and abort
                         print(f"     🔴 ORDER FAILED: Trying to cancel...")
                         try:
-                            exchange.cancel_order(order_id, symbol)
+                            await safe_exchange_call(exchange.cancel_order, order_id, symbol, timeout=5)
                         except:
                             pass
                         return {"success": False, "reason": f"ORDER_NOT_FILLED: {order_status}"}
@@ -1370,17 +2936,14 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
         sl_side = "sell" if direction == "LONG" else "buy"
         try:
             # Kraken Futures requires 'stop' order type with triggerPrice
-            sl_order = exchange.create_order(
-                symbol=symbol,
-                type='stop',
-                side=sl_side,
-                amount=position_size,
-                price=sl,  # Trigger price for stop order
-                params={
-                    'triggerPrice': sl,
-                    'reduceOnly': True
-                }
+            sl_order = await safe_exchange_call(
+                exchange.create_order,
+                symbol, 'stop', sl_side, position_size, sl, None,
+                {'triggerPrice': sl, 'reduceOnly': True},
+                timeout=10, max_retries=3
             )
+            if sl_order is None:
+                raise Exception("SL order timeout after retries")
             sl_order_id = sl_order.get('id')
             print(f"     🛡️ EXCHANGE SL placed @ ${sl:.2f} (ID: {sl_order_id})")
         except Exception as sl_err:
@@ -1389,15 +2952,17 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
             try:
                 # Emergency close - SL is mandatory
                 close_side = "sell" if direction == "LONG" else "buy"
-                exchange.create_order(
-                    symbol=symbol,
-                    type='market',
-                    side=close_side,
-                    amount=position_size,
-                    params={'reduceOnly': True}
+                close_order = await safe_exchange_call(
+                    exchange.create_order,
+                    symbol, 'market', close_side, position_size, None, None,
+                    {'reduceOnly': True},
+                    timeout=10
                 )
-                print(f"     🚨 EMERGENCY CLOSE - Position closed due to SL failure")
-                return {"success": False, "reason": "SL_ORDER_FAILED_EMERGENCY_CLOSE"}
+                if close_order:
+                    print(f"     🚨 EMERGENCY CLOSE - Position closed due to SL failure")
+                    return {"success": False, "reason": "SL_ORDER_FAILED_EMERGENCY_CLOSE"}
+                else:
+                    print(f"     🔴 CRITICAL: Emergency close also failed!")
             except Exception as close_err:
                 print(f"     🔴 CRITICAL: Could not close position: {close_err}")
                 # Send emergency alert
@@ -1449,7 +3014,86 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
             print(f"        SL: ${sl:.2f} | TP1: ${tp1:.2f} | TP2: ${tp2:.2f} | TP3: ${exit_levels.tp3 or 'Runner'}")
             print(f"        Trailing: {exit_levels.trailing_distance:.2f} | MaxHold: {exit_levels.max_hold_minutes}min")
         
-        # Track position for trailing stop management
+        # v8.9.25: NET PROFIT ENGINE - Check if TP1 makes sense after fees
+        # Calculate risk in USD
+        if direction == "LONG":
+            sl_distance_pct = abs(price - sl) / price
+        else:
+            sl_distance_pct = abs(sl - price) / price
+        risk_usd = position_size_usd * sl_distance_pct
+        
+        # Get RR from exit levels (TP1 is typically 1R)
+        if exit_levels.tp1:
+            if direction == "LONG":
+                tp1_distance = exit_levels.tp1 - price
+                sl_distance = price - sl
+            else:
+                tp1_distance = price - exit_levels.tp1
+                sl_distance = sl - price
+            rr_target = tp1_distance / sl_distance if sl_distance > 0 else 1.0
+        else:
+            rr_target = 1.0  # Default to 1R
+        
+        # Create net profit context
+        net_ctx = NetProfitContext(
+            position_size_usd=position_size_usd,
+            risk_usd=risk_usd,
+            rr_target=rr_target,
+            fee_config=FeeConfig(),
+            min_net_profit_usd=0.50  # FUND minimum
+        )
+        
+        # Optimize RR after fees
+        net_result = optimize_rr_after_fees(net_ctx)
+        
+        # If TP is too small after fees, adjust trade mode or TP1
+        if not net_result.valid:
+            print(f"     ⚠️ NET PROFIT CHECK: TP1 too small after fees (${net_result.estimated_net_profit_usd:.2f} < ${net_ctx.min_net_profit_usd:.2f})")
+            print(f"     🔄 Required RR: {net_result.adjusted_rr:.2f} (current: {rr_target:.2f})")
+            
+            # If required RR is too high (>2.0), switch to RUNNER_ONLY mode
+            if net_result.adjusted_rr > 2.0:
+                trade_mode = "RUNNER_ONLY"
+                print(f"     🎯 Switching to RUNNER_ONLY mode (skip TP1/TP2, go to TP3)")
+            elif exit_levels.tp1:
+                # Adjust TP1 to meet minimum profit
+                if direction == "LONG":
+                    tp1 = price + (price - sl) * net_result.adjusted_rr
+                else:
+                    tp1 = price - (sl - price) * net_result.adjusted_rr
+                print(f"     📊 Adjusted TP1: ${tp1:.2f} (RR: {net_result.adjusted_rr:.2f})")
+        else:
+            print(f"     ✅ NET PROFIT CHECK: TP1 OK (Net: ${net_result.estimated_net_profit_usd:.2f}, Fees: ${net_result.fees_usd:.2f})")
+        
+        # v8.9.25: EXPECTANCY ENGINE - Check if trade has positive expectancy
+        # Get historical win rate
+        win_rate_data = get_win_rate()
+        # get_win_rate() returns win_rate as percentage (e.g., 48.5), convert to decimal (0.485)
+        historical_win_rate = win_rate_data.get("win_rate", 0) / 100.0 if win_rate_data.get("win_rate", 0) > 1.0 else win_rate_data.get("win_rate", 0)
+        
+        # Use adjusted RR if net profit check adjusted it
+        final_rr = net_result.adjusted_rr if not net_result.valid and net_result.adjusted_rr <= 2.0 else rr_target
+        
+        # Only check expectancy if we have enough historical data (at least 10 trades)
+        if win_rate_data.get("total", 0) >= 10:
+            exp_ctx = ExpectancyContext(
+                win_rate=historical_win_rate,
+                rr=final_rr,
+                min_expectancy=0.10  # FUND minimum
+            )
+            
+            exp_result = evaluate_expectancy(exp_ctx)
+            
+            if not exp_result.valid:
+                print(f"     🚫 EXPECTANCY CHECK: Trade blocked (Expectancy: {exp_result.expectancy:.3f} < {exp_ctx.min_expectancy})")
+                print(f"        Win Rate: {historical_win_rate*100:.1f}% | RR: {final_rr:.2f}")
+                return {"success": False, "reason": f"EXPECTANCY_FAIL ({exp_result.expectancy:.3f})"}
+            else:
+                print(f"     ✅ EXPECTANCY CHECK: Trade OK (Expectancy: {exp_result.expectancy:.3f}, Win Rate: {historical_win_rate*100:.1f}%, RR: {final_rr:.2f})")
+        else:
+            print(f"     ⚠️ EXPECTANCY CHECK: Skipped (insufficient data: {win_rate_data.get('total', 0)} trades, need 10+)")
+        
+        # Track position for trailing stop management (lock still held from check above)
         open_positions[symbol] = {
             "symbol": symbol,
             "direction": direction,
@@ -1486,6 +3130,7 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
             "confirmation_count": confirmation_count,
             "entry_type": entry_type,
             "trade_mode": trade_mode,
+            "strategy_name": kwargs.get('strategy_name', 'TREND_CONTINUATION'),  # Strategy identification
             "exit_profile": {
                 "breakeven_after_tp1": exit_levels.breakeven_after_tp1,
                 "trailing_enabled": exit_levels.trailing_enabled,
@@ -1536,50 +3181,84 @@ async def update_exchange_sl(symbol, new_sl_price, position_size):
     v8.9.21: Update exchange-side stop loss order when trailing stop moves.
     
     Cancel old SL order and place new one at updated price.
+    WITH RETRY LOGIC AND VERIFICATION.
     """
     global open_positions
     
-    if symbol not in open_positions:
-        return {"success": False, "reason": "NO_LOCAL_POSITION"}
+    async with position_lock:
+        if symbol not in open_positions:
+            return {"success": False, "reason": "NO_LOCAL_POSITION"}
+        
+        position = open_positions[symbol]
+        old_sl_order_id = position.get('exchange_sl_order_id')
+        direction = position['direction']
+        remaining_size = position.get('remaining_size', position_size)
     
-    position = open_positions[symbol]
-    old_sl_order_id = position.get('exchange_sl_order_id')
-    direction = position['direction']
-    remaining_size = position.get('remaining_size', position_size)
-    
-    try:
-        # Cancel old SL order if exists
-        if old_sl_order_id:
+    # Operations outside lock to avoid blocking
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Cancel old SL order if exists
+            if old_sl_order_id:
+                try:
+                    await safe_exchange_call(exchange.cancel_order, old_sl_order_id, symbol, timeout=5)
+                    print(f"     🗑️ Old SL order cancelled (ID: {old_sl_order_id})")
+                except Exception as cancel_err:
+                    print(f"     ⚠️ Could not cancel old SL: {cancel_err}")
+                    # Continue anyway - new order will replace it
+            
+            # Place new SL order
+            sl_side = "sell" if direction == "LONG" else "buy"
+            sl_order = await safe_exchange_call(
+                exchange.create_order,
+                symbol, 'market', sl_side, remaining_size, None, None,
+                {'stopPrice': new_sl_price, 'reduceOnly': True},
+                timeout=10, max_retries=2
+            )
+            
+            if sl_order is None:
+                if attempt < max_retries - 1:
+                    print(f"     ⚠️ SL update failed, retrying ({attempt+1}/{max_retries})...")
+                    await asyncio.sleep(1 * (attempt + 1))
+                    continue
+                else:
+                    log_risk_event("SL_UPDATE_FAILED", f"Failed to update SL for {symbol} after {max_retries} attempts", "critical")
+                    return {"success": False, "reason": "SL_UPDATE_FAILED_AFTER_RETRIES"}
+            
+            new_sl_order_id = sl_order.get('id')
+            
+            # VERIFY: Check that order actually exists
             try:
-                exchange.cancel_order(old_sl_order_id, symbol)
-                print(f"     🗑️ Old SL order cancelled (ID: {old_sl_order_id})")
-            except Exception as cancel_err:
-                print(f"     ⚠️ Could not cancel old SL: {cancel_err}")
-        
-        # Place new SL order
-        sl_side = "sell" if direction == "LONG" else "buy"
-        sl_order = exchange.create_order(
-            symbol=symbol,
-            type='market',
-            side=sl_side,
-            amount=remaining_size,
-            params={
-                'stopPrice': new_sl_price,
-                'reduceOnly': True
-            }
-        )
-        
-        new_sl_order_id = sl_order.get('id')
-        position['exchange_sl_order_id'] = new_sl_order_id
-        position['current_sl'] = new_sl_price
-        
-        print(f"     🛡️ Exchange SL updated to ${new_sl_price:.2f} (ID: {new_sl_order_id})")
-        
-        return {"success": True, "order_id": new_sl_order_id, "new_sl": new_sl_price}
-        
-    except Exception as e:
-        print(f"     ⚠️ Failed to update exchange SL: {e}")
-        return {"success": False, "reason": str(e)}
+                verify_order = await safe_exchange_call(exchange.fetch_order, new_sl_order_id, symbol, timeout=5)
+                if verify_order is None:
+                    print(f"     ⚠️ Could not verify SL order - retrying...")
+                    if attempt < max_retries - 1:
+                        continue
+            except:
+                if attempt < max_retries - 1:
+                    continue
+            
+            # Update position tracking (with lock)
+            async with position_lock:
+                if symbol in open_positions:
+                    open_positions[symbol]['exchange_sl_order_id'] = new_sl_order_id
+                    open_positions[symbol]['current_sl'] = new_sl_price
+            
+            print(f"     🛡️ Exchange SL updated to ${new_sl_price:.2f} (ID: {new_sl_order_id})")
+            
+            return {"success": True, "order_id": new_sl_order_id, "new_sl": new_sl_price}
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"     ⚠️ SL update error (attempt {attempt+1}/{max_retries}): {e}")
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            else:
+                print(f"     ⚠️ Failed to update exchange SL after {max_retries} attempts: {e}")
+                log_risk_event("SL_UPDATE_ERROR", f"SL update failed for {symbol}: {e}", "critical")
+                return {"success": False, "reason": str(e)}
+    
+    return {"success": False, "reason": "SL_UPDATE_FAILED"}
 
 async def cancel_exchange_sl(symbol):
     """v8.9.21: Cancel exchange-side SL order when position is closed."""
@@ -1594,9 +3273,12 @@ async def cancel_exchange_sl(symbol):
     if not sl_order_id:
         return {"success": True, "reason": "NO_SL_ORDER"}
     
+    # Cancel outside lock
     try:
-        exchange.cancel_order(sl_order_id, symbol)
-        position['exchange_sl_order_id'] = None
+        await safe_exchange_call(exchange.cancel_order, sl_order_id, symbol, timeout=5)
+        async with position_lock:
+            if symbol in open_positions:
+                open_positions[symbol]['exchange_sl_order_id'] = None
         print(f"     🗑️ Exchange SL cancelled (ID: {sl_order_id})")
         return {"success": True}
     except Exception as e:
@@ -1623,8 +3305,10 @@ async def close_full_position(symbol, reason="MANUAL"):
         # v8.9.21: Cancel exchange-side SL order first
         await cancel_exchange_sl(symbol)
         
-        # Get current position from Kraken
-        positions = exchange.fetch_positions()
+        # Get current position from Kraken (with timeout)
+        positions = await safe_exchange_call(exchange.fetch_positions, timeout=10)
+        if positions is None:
+            return {"success": False, "reason": "FETCH_POSITIONS_TIMEOUT"}
         
         position_data = None
         for pos in positions:
@@ -1636,8 +3320,9 @@ async def close_full_position(symbol, reason="MANUAL"):
         
         if not position_data:
             # Remove from local tracking if exists
-            if symbol in open_positions:
-                del open_positions[symbol]
+            async with position_lock:
+                if symbol in open_positions:
+                    del open_positions[symbol]
             return {"success": False, "reason": "NO_POSITION_FOUND"}
         
         total_size = float(position_data['contracts'])
@@ -1645,17 +3330,18 @@ async def close_full_position(symbol, reason="MANUAL"):
         entry_price = float(position_data['entryPrice']) if position_data['entryPrice'] else 0
         unrealized_pnl = float(position_data['unrealizedPnl']) if position_data['unrealizedPnl'] else 0
         
-        # Close order (opposite side)
+        # Close order (opposite side) - with timeout
         close_side = "sell" if pos_side == 'long' else "buy"
         direction = "LONG" if pos_side == 'long' else "SHORT"
         
-        order = exchange.create_order(
-            symbol=symbol,
-            type='market',
-            side=close_side,
-            amount=total_size,
-            params={'reduceOnly': True}
+        order = await safe_exchange_call(
+            exchange.create_order,
+            symbol, 'market', close_side, total_size, None, None,
+            {'reduceOnly': True},
+            timeout=10
         )
+        if order is None:
+            return {"success": False, "reason": "CLOSE_ORDER_TIMEOUT"}
         
         close_price = order.get('average') or 0
         
@@ -1675,6 +3361,21 @@ async def close_full_position(symbol, reason="MANUAL"):
         else:
             auto_trading_state['daily_losses'] += 1
             auto_trading_state['weekly_losses'] += 1
+
+        pnl_eur = pnl * get_usd_eur_rate()
+        asset_performance.update(symbol, pnl_eur)
+        sunday_engine.update_sunday_stats({
+            "asset": symbol,
+            "profit": pnl
+        })
+
+        if PROFIT_MODE_ENABLED:
+            trade_profit = pnl_eur
+            position_basis_price = entry_price or close_price
+            position_size_eur = (position_basis_price * total_size) * get_usd_eur_rate()
+            profit_tracker.add_trade_result(trade_profit, position_size_eur)
+            current_target = auto_adjust_targets.current_target if AUTO_ADJUST_TARGETS_ENABLED else DAILY_PROFIT_TARGET_EUR
+            print(f"     💰 PROFIT MODE: Daily {profit_tracker.daily_profit:.2f}€ / {current_target:.2f}€")
         
         # Remove from local tracking
         if symbol in open_positions:
@@ -1713,6 +3414,24 @@ def reset_daily_stats():
     
     # Daily reset
     if now.date() > auto_trading_state['last_reset']:
+        sunday_engine.reset_daily_stats()
+        if PROFIT_MODE_ENABLED:
+            current_target = auto_adjust_targets.current_target if AUTO_ADJUST_TARGETS_ENABLED else DAILY_PROFIT_TARGET_EUR
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(
+                        DailyReport.send_daily_summary(
+                            profit_tracker,
+                            asset_performance,
+                            current_target,
+                            WEEKLY_PROFIT_TARGET_EUR,
+                            send_telegram_status
+                        )
+                    )
+            except RuntimeError:
+                pass
+
         print(f"📊 Daily Stats Reset - Yesterday: P&L=${auto_trading_state['daily_pnl']:.2f}, "
               f"Trades={auto_trading_state['daily_trades']}, "
               f"W/L={auto_trading_state['daily_wins']}/{auto_trading_state['daily_losses']}")
@@ -1728,6 +3447,7 @@ def reset_daily_stats():
             auto_trading_state['pause_reason'] = None
             auto_trading_state['pause_type'] = None
         
+        # Note: Peak equity is NOT reset daily - it tracks "all-time" high
         auto_trading_state['last_reset'] = now.date()
     
     # Weekly reset (Monday UTC) - v8.9.18
@@ -1752,11 +3472,13 @@ def reset_daily_stats():
         auto_trading_state['weekly_wins'] = 0
         auto_trading_state['weekly_losses'] = 0
         
-        # Reset weekly pause
+        # Reset weekly pause (but not max drawdown - that requires manual reset)
         if auto_trading_state['pause_type'] == "WEEKLY":
             auto_trading_state['is_paused'] = False
             auto_trading_state['pause_reason'] = None
             auto_trading_state['pause_type'] = None
+        
+        # Note: Peak equity is NOT reset weekly - it tracks "all-time" high
         
         auto_trading_state['last_weekly_reset'] = now.date()
 
@@ -1768,6 +3490,10 @@ async def fetch_kraken_positions():
     global kraken_positions
     
     if not POSITION_TRACKING_ENABLED:
+        return {}
+    
+    if DISABLE_KRAKEN_IN_SIGNAL_ONLY and not AUTO_TRADING_ENABLED:
+        return kraken_positions['positions']
         return {}
     
     now = datetime.now(timezone.utc)
@@ -1894,6 +3620,8 @@ async def fetch_kraken_positions():
         
         kraken_positions['positions'] = new_positions
         kraken_positions['last_fetch'] = now
+        kraken_positions['fetch_failed'] = False
+        kraken_positions['consecutive_failures'] = 0
         
         if new_positions:
             pos_list = [f"{ASSET_NAMES.get(s, s)} {p['direction']} {p['leverage']}x" for s, p in new_positions.items()]
@@ -1903,6 +3631,8 @@ async def fetch_kraken_positions():
         
     except Exception as e:
         print(f"⚠️ Error fetching Kraken positions: {e}")
+        kraken_positions['fetch_failed'] = True
+        kraken_positions['consecutive_failures'] = kraken_positions.get('consecutive_failures', 0) + 1
         return kraken_positions['positions']  # Return cached positions
 
 def has_open_position(symbol, direction=None):
@@ -2101,6 +3831,7 @@ async def sync_positions_with_kraken():
                     bot_stats["losses"] += 1
                 
                 # Calculate P&L in USD and update risk limits (v8.9.23 fix)
+                # WITH DOUBLE-COUNTING PREVENTION
                 contracts = pos.get('size', 0)
                 if contracts > 0 and entry_price > 0:
                     if direction == "LONG":
@@ -2111,17 +3842,27 @@ async def sync_positions_with_kraken():
                     # Fallback: estimate from percentage and margin
                     pnl_usd = size_usd * (pnl_pct / 100)
                 
-                auto_trading_state['daily_pnl'] += pnl_usd
-                auto_trading_state['weekly_pnl'] += pnl_usd
-                auto_trading_state['weekly_trades'] += 1
-                if is_win:
-                    auto_trading_state['daily_wins'] += 1
-                    auto_trading_state['weekly_wins'] += 1
+                # Check if P&L already counted (prevent double counting)
+                position_id = pos.get('position_id')
+                if not pos.get('pnl_counted', False):
+                    auto_trading_state['daily_pnl'] += pnl_usd
+                    auto_trading_state['weekly_pnl'] += pnl_usd
+                    auto_trading_state['weekly_trades'] += 1
+                    if is_win:
+                        auto_trading_state['daily_wins'] += 1
+                        auto_trading_state['weekly_wins'] += 1
+                    else:
+                        auto_trading_state['daily_losses'] += 1
+                        auto_trading_state['weekly_losses'] += 1
+                    pos['pnl_counted'] = True  # Mark as counted
                 else:
-                    auto_trading_state['daily_losses'] += 1
-                    auto_trading_state['weekly_losses'] += 1
+                    print(f"  ⚠️ P&L already counted for {symbol} (position_id: {position_id}) - skipping")
                 
                 print(f"  💰 P&L: ${pnl_usd:+.2f} | Daily: ${auto_trading_state['daily_pnl']:.2f}")
+                
+                # v8.9.25: Update peak equity after position close
+                current_equity = get_current_equity()
+                update_peak_equity(current_equity)
                 
                 # Record to trade results file
                 record_trade_result(symbol, direction, result, pnl_pct, pos.get('is_counter_trend', False))
@@ -2190,8 +3931,9 @@ async def sync_positions_with_kraken():
                 # Get current price
                 current_price = df['close'].iloc[-1]
                 
-                # Create position tracking
-                open_positions[symbol] = {
+                # Create position tracking (with lock)
+                async with position_lock:
+                    open_positions[symbol] = {
                     "symbol": symbol,
                     "direction": direction,
                     "entry_price": entry_price,
@@ -2216,6 +3958,7 @@ async def sync_positions_with_kraken():
                     "last_notified_sl": sl,
                     "from_kraken": True,
                     "manual_entry": True,
+                    "strategy_name": "TREND_CONTINUATION",  # Default for manual entries
                 }
                 
                 asset_name = ASSET_NAMES.get(symbol, symbol)
@@ -2286,6 +4029,7 @@ def create_position(signal, signal_id=None, size=0):
         "open_time": datetime.now(timezone.utc),
         "last_update": datetime.now(timezone.utc),
         "signal_id": signal_id,
+        "strategy_name": signal.get('strategy_name', 'TREND_CONTINUATION'),  # Strategy identification
     }
 
 def auto_mark_signal_result(position, close_reason, current_price):
@@ -2630,7 +4374,7 @@ def detect_rsi_divergence(df: pd.DataFrame, direction: str = "LONG", lookback: i
         print(f"RSI divergence detection error: {e}")
         return False
 
-def detect_market_regime():
+def detect_macro_market_regime():
     """
     Detect market regime based on BTC trend vs 200 EMA + ADX + BB Squeeze.
     v8.9.23: Uses Market Regime Engine v1.0 for BULL/BEAR/RANGE detection.
@@ -2684,7 +4428,7 @@ def detect_market_regime():
         market_regime_state["adx"] = adx_value
         
         # v8.9.23: Use Market Regime Engine v2 for multi-factor detection
-        regime_ctx = RegimeContext(
+        regime_ctx = RegimeV2Context(
             ema_fast=ema50_value,
             ema_slow=ema200_value,
             ema_slope=ema50_slope,
@@ -2912,6 +4656,17 @@ def check_circuit_breaker():
     if not CIRCUIT_BREAKER_ENABLED:
         return False, None
     
+    now = datetime.now(timezone.utc)
+    cooldown_until = circuit_state.get("cooldown_until")
+    if cooldown_until:
+        if now < cooldown_until:
+            circuit_state["is_paused"] = True
+            circuit_state["pause_reason"] = f"COOLDOWN until {cooldown_until.strftime('%H:%M UTC')}"
+            return True, circuit_state["pause_reason"]
+        else:
+            circuit_state["cooldown_until"] = None
+            circuit_state["consecutive_losses"] = 0
+    
     if circuit_state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
         circuit_state["is_paused"] = True
         circuit_state["pause_reason"] = f"{MAX_CONSECUTIVE_LOSSES} consecutive losses"
@@ -2928,9 +4683,17 @@ def record_signal_result(is_win):
     if is_win:
         circuit_state["consecutive_losses"] = 0
         circuit_state["last_signal_result"] = "WIN"
+        circuit_state["cooldown_until"] = None
     else:
         circuit_state["consecutive_losses"] += 1
         circuit_state["last_signal_result"] = "LOSS"
+        
+        if LOSS_COOLDOWN_ENABLED:
+            now = datetime.now(timezone.utc)
+            if circuit_state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+                circuit_state["cooldown_until"] = now + timedelta(minutes=LOSS_COOLDOWN_HARD_MINUTES)
+            elif circuit_state["consecutive_losses"] >= LOSS_COOLDOWN_AFTER:
+                circuit_state["cooldown_until"] = now + timedelta(minutes=LOSS_COOLDOWN_MINUTES)
         
         # Log risk event for consecutive losses (v8.9.18)
         if circuit_state["consecutive_losses"] >= 2:
@@ -2945,6 +4708,7 @@ def reset_circuit_breaker():
     circuit_state["consecutive_losses"] = 0
     circuit_state["is_paused"] = False
     circuit_state["pause_reason"] = None
+    circuit_state["cooldown_until"] = None
 
 # ================================
 # SIGNAL FILTERS CHECK
@@ -2987,10 +4751,22 @@ def check_all_filters(direction, signal_data=None):
         # v8.9.20: Restored strict threshold
         confluence_score = signal_data.get('confluence_score', 0) if signal_data else 0
         is_strong_confluence = confluence_score >= 55
+
+        # Bounce long in BEAR (support + bullish reversal)
+        support_bounce = signal_data.get('support_bounce', False) if signal_data else False
+        has_bullish_reversal = signal_data.get('has_bullish_reversal', False) if signal_data else False
+        allow_bounce_long = (
+            BOUNCE_LONG_ENABLED
+            and support_bounce
+            and has_bullish_reversal
+            and confluence_score >= BOUNCE_LONG_MIN_CONFLUENCE
+        )
         
         if is_extreme_oversold:
             # Allow contrarian LONG - skip bear market blocking
             reasons.append("CONTRARIAN_OVERSOLD")
+        elif allow_bounce_long:
+            reasons.append("BOUNCE_LONG")
         elif is_strong_quant:
             # v8.9.2: Allow counter-trend LONG with strong quant confirmation
             reasons.append(f"QUANT_COUNTER_TREND (+{quant_bias})")
@@ -3086,6 +4862,7 @@ def check_all_filters(direction, signal_data=None):
                 market_regime = signal_data.get('market_regime', 'BULL')
                 higher_tf_bias = signal_data.get('higher_tf_bias', 'NEUTRAL')
                 setup_type = signal_data.get('setup_type', 'CONTINUATION')
+                confluence_score = signal_data.get('confluence_score', 0)
                 
                 # Determine volatility level from ATR ratio
                 if atr_ratio >= 1.4:
@@ -3109,7 +4886,9 @@ def check_all_filters(direction, signal_data=None):
                     market_regime=market_regime,
                     higher_tf_bias=higher_tf_bias,
                     setup_type=setup_type,
-                    volatility_level=volatility_level
+                    volatility_level=volatility_level,
+                    direction=direction,
+                    confluence_score=confluence_score
                 )
                 
                 # v8.9.23: If SCALP_REBOUND active, override min_rr
@@ -3147,10 +4926,11 @@ def check_all_filters(direction, signal_data=None):
 # Professional traders don't trade in the middle of ranges
 # ================================
 CONSOLIDATION_GUARD_ENABLED = True
-CONSOLIDATION_ATR_THRESHOLD = 0.6      # Minimum ATR% for volatility (below = sleeping)
-CONSOLIDATION_RANGE_EDGE_PCT = 30      # Must be within 30% of range edge
-CONSOLIDATION_MOMENTUM_MIN = 35        # Minimum wave/momentum score
-CONSOLIDATION_ADX_MIN = 20             # Minimum ADX for trend strength
+# Cashflow-friendly consolidation thresholds
+CONSOLIDATION_ATR_THRESHOLD = 0.40     # Slightly stricter volatility floor
+CONSOLIDATION_RANGE_EDGE_PCT = 35      # Require closer to range edges
+CONSOLIDATION_MOMENTUM_MIN = 28        # Require a bit more momentum
+CONSOLIDATION_ADX_MIN = 16             # Require stronger trend
 
 def is_consolidating(df, current_price, signal_data=None, lookback=50):
     """
@@ -3173,6 +4953,7 @@ def is_consolidating(df, current_price, signal_data=None, lookback=50):
     
     reasons = []
     consolidation_score = 0
+    atr_thr, range_edge_pct, momentum_min, adx_min = get_adaptive_consolidation_thresholds()
     
     try:
         # 1. Calculate range (high-low over lookback period)
@@ -3191,7 +4972,7 @@ def is_consolidating(df, current_price, signal_data=None, lookback=50):
         distance_pct = (min_distance / range_size) * 100
         
         # If price is in middle of range (>30% from both edges)
-        if distance_pct > CONSOLIDATION_RANGE_EDGE_PCT:
+        if distance_pct > range_edge_pct:
             consolidation_score += 30
             reasons.append(f"MID_RANGE ({100-distance_pct:.0f}% from edge)")
         
@@ -3200,17 +4981,17 @@ def is_consolidating(df, current_price, signal_data=None, lookback=50):
         if atr is not None and len(atr) > 0:
             atr_value = atr.iloc[-1]
             atr_pct = (atr_value / current_price) * 100
-            if atr_pct < CONSOLIDATION_ATR_THRESHOLD:
+            if atr_pct < atr_thr:
                 consolidation_score += 25
-                reasons.append(f"LOW_VOL (ATR={atr_pct:.2f}%<{CONSOLIDATION_ATR_THRESHOLD}%)")
+                reasons.append(f"LOW_VOL (ATR={atr_pct:.2f}%<{atr_thr:.2f}%)")
         
         # 4. Check ADX (trend strength)
         adx, _, _ = calc_adx(df, period=14)
         if adx is not None and len(adx) > 0:
             adx_value = adx.iloc[-1]
-            if adx_value < CONSOLIDATION_ADX_MIN:
+            if adx_value < adx_min:
                 consolidation_score += 25
-                reasons.append(f"WEAK_TREND (ADX={adx_value:.0f}<{CONSOLIDATION_ADX_MIN})")
+                reasons.append(f"WEAK_TREND (ADX={adx_value:.0f}<{adx_min})")
         
         # 5. Check Bollinger Band squeeze (volatility contraction)
         bb_lower, bb_mid, bb_upper = calc_bollinger(df['close'], period=20)
@@ -3224,9 +5005,9 @@ def is_consolidating(df, current_price, signal_data=None, lookback=50):
         # 6. Check signal momentum/wave score if available
         if signal_data:
             wave_score = signal_data.get('wave_score', 50)
-            if wave_score < CONSOLIDATION_MOMENTUM_MIN:
+            if wave_score < momentum_min:
                 consolidation_score += 20
-                reasons.append(f"WEAK_MOMENTUM (Wave={wave_score}<{CONSOLIDATION_MOMENTUM_MIN})")
+                reasons.append(f"WEAK_MOMENTUM (Wave={wave_score}<{momentum_min})")
         
         # Consolidation detected if score >= 50
         is_consol = consolidation_score >= 50
@@ -3263,6 +5044,27 @@ def calc_bollinger(close, period=20):
 
 def calc_atr(df, period=14):
     return AverageTrueRange(df['high'], df['low'], df['close'], window=period).average_true_range()
+
+def detect_support_bounce(df, current_price: float, relax_level: int = 0) -> tuple:
+    """
+    Simple support-bounce detector for BEAR bounce longs.
+    Returns (is_bounce, distance_pct_from_support).
+    """
+    try:
+        if df is None or len(df) < 30:
+            return False, None
+        lookback = 48
+        recent_low = df['low'].tail(lookback).min()
+        if not recent_low or current_price <= 0:
+            return False, None
+        distance_pct = (current_price - recent_low) / current_price * 100
+        last = df.iloc[-1]
+        bullish_candle = last['close'] > last['open']
+        threshold = 0.5 + (0.2 * max(0, int(relax_level)))
+        is_bounce = bullish_candle and 0 <= distance_pct <= threshold
+        return is_bounce, distance_pct
+    except Exception:
+        return False, None
 
 # ================================
 # VWAP CALCULATION (v8.9.9)
@@ -3408,6 +5210,41 @@ def check_vwap_filter(direction, vwap_signal):
         return True, "VWAP_OK"
     
     return True, "VWAP_OK"
+
+
+def bearish_impulse(df, lookback: int = 2, avg_range_period: int = 20) -> bool:
+    if df is None or len(df) < (avg_range_period + 2):
+        return False
+
+    ranges = (df["high"] - df["low"])
+    avg_range = ranges.iloc[-(avg_range_period + 2):-2].mean()
+    if avg_range is None or avg_range <= 0:
+        return False
+
+    candles = df[["open", "high", "low", "close"]].to_dict("records")
+    impulse = candles[-2]
+    next_candle = candles[-1]
+
+    impulse_range = impulse["high"] - impulse["low"]
+    if impulse_range <= 0:
+        return False
+
+    big_range = impulse_range >= (1.5 * avg_range)
+    strong_close = impulse["close"] <= (impulse["low"] + 0.25 * impulse_range)
+
+    swings = detect_swings(candles, lookback=lookback)
+    prev_swing_lows = [
+        s for s in swings if s["type"] == "LOW" and s["index"] < (len(candles) - 2)
+    ]
+    if not prev_swing_lows:
+        return False
+    prev_swing_low = prev_swing_lows[-1]["price"]
+    ll_printed = impulse["low"] < prev_swing_low
+
+    impulse_mid = impulse["low"] + 0.5 * impulse_range
+    no_reclaim = next_candle["close"] <= impulse_mid
+
+    return bool(big_range and strong_close and ll_printed and no_reclaim)
 
 # ================================
 # SUPPORT/RESISTANCE ZONES (v8.7)
@@ -3807,6 +5644,45 @@ def analyze_market_structure(df, lookback=50):
     
     return result
 
+
+def classify_htf_structure_state(df_1h, df_htf=None, supply_zone=None, demand_zone=None):
+    """
+    Classify HTF structure into STRONG_BEAR / BEARISH_TRANSITION / RANGE / STRONG_BULL.
+    Uses HTF structure, EMA alignment, and price vs HTF zones/VWAP.
+    """
+    if df_1h is None or len(df_1h) < 50:
+        return "RANGE"
+
+    structure = analyze_market_structure(df_1h, lookback=50)
+    close_1h = df_1h["close"].iloc[-1]
+    ema21_1h = calc_ema(df_1h["close"], 21).iloc[-1]
+    ema50_1h = calc_ema(df_1h["close"], 50).iloc[-1]
+    ema_spread = abs(ema21_1h - ema50_1h) / close_1h if close_1h else 0
+    ema_tangled = ema_spread < 0.0015
+
+    vwap_series = calc_vwap(df_1h, period=50)
+    vwap_1h = vwap_series.iloc[-1] if vwap_series is not None and len(vwap_series) > 0 else close_1h
+
+    below_htf_supply = supply_zone is not None and close_1h < supply_zone.bottom
+    above_htf_demand = demand_zone is not None and close_1h > demand_zone.top
+
+    bos_down = structure.get("structure_break") == "BEARISH_BREAK"
+    bos_up = structure.get("structure_break") == "BULLISH_BREAK"
+    down_structure = structure.get("structure") == "BEARISH" and structure.get("ll_count", 0) >= 1 and structure.get("lh_count", 0) >= 1
+    up_structure = structure.get("structure") == "BULLISH" and structure.get("hh_count", 0) >= 1 and structure.get("hl_count", 0) >= 1
+
+    if bos_down and down_structure and (below_htf_supply or close_1h < vwap_1h):
+        return "STRONG_BEAR"
+    if bos_up and up_structure and (above_htf_demand or close_1h > vwap_1h):
+        return "STRONG_BULL"
+    if ema_tangled or structure.get("structure") == "NEUTRAL":
+        return "RANGE"
+    if down_structure or bos_down:
+        return "BEARISH_TRANSITION"
+    if up_structure or bos_up:
+        return "STRONG_BULL"
+    return "RANGE"
+
 def get_structure_signal_filter(structure_result, direction):
     """
     Filtruoti signalus pagal market structure.
@@ -3917,6 +5793,140 @@ async def fetch_ohlcv(symbol, timeframe, limit=100):
     except Exception as e:
         print(f"Error fetching {symbol} {timeframe}: {e}")
         return None
+
+def fetch_ohlcv_sync(symbol, timeframe, limit=100):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
+    except Exception as e:
+        print(f"Error fetching {symbol} {timeframe}: {e}")
+        return None
+
+def _to_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _load_quant_cache():
+    cache_path = os.path.join(os.path.dirname(__file__), "quant_cache.json")
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Quant cache load error: {e}")
+        return None
+
+def _save_quant_cache(results, correlation, last_update):
+    cache_path = os.path.join(os.path.dirname(__file__), "quant_cache.json")
+    try:
+        payload = {
+            "assets": results,
+            "correlation": correlation,
+            "last_update": last_update.isoformat() if last_update else None
+        }
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        print(f"Quant cache save error: {e}")
+
+def run_quant_analysis_sync():
+    if not QUANT_ENABLED or quant_engine is None:
+        return {}, None
+    results = {}
+    returns_by_asset = {}
+    max_daily_candles = 1460  # ~4 years of daily data
+    
+    for symbol in FUTURES_ASSETS:
+        asset_name = ASSET_NAMES.get(symbol, symbol.replace('PF_', '').replace('USD', ''))
+        df_daily = fetch_ohlcv_sync(symbol, TIMEFRAME_DAILY, limit=max_daily_candles)
+        if df_daily is None or len(df_daily) < 60:
+            continue
+        
+        prices = df_daily['close'].astype(float)
+        mc7 = quant_engine.monte_carlo_simulation(prices, n_simulations=350, days=7)
+        mc30 = quant_engine.monte_carlo_simulation(prices, n_simulations=350, days=30)
+        arima = quant_engine.arima_forecast(prices)
+        mr = quant_engine.mean_reversion_analysis(prices)
+        fib = quant_engine.fibonacci_levels(prices)
+        vol_regime = quant_engine.volatility_regime(prices)
+        
+        returns = prices.pct_change().dropna()
+        returns_by_asset[asset_name] = returns
+        annual_vol = _to_float(returns.std() * (365 ** 0.5), 0.0) if len(returns) > 0 else 0.0
+        
+        fib_signal = fib.get('signal', 0)
+        if fib_signal > 0:
+            fib_zone = "SUPPORT"
+            fib_bias = "BULLISH"
+        elif fib_signal < 0:
+            fib_zone = "RESISTANCE"
+            fib_bias = "BEARISH"
+        else:
+            fib_zone = "MID"
+            fib_bias = "NEUTRAL"
+        
+        results[asset_name] = {
+            "monte_carlo_7d": {
+                "prob_up": _to_float(mc7.get("prob_up", 0.5), 0.5),
+                "prob_down": _to_float(mc7.get("prob_down", 0.5), 0.5),
+                "expected_price": _to_float(mc7.get("expected_price", 0), 0.0),
+                "current_price": _to_float(mc7.get("current_price", 0), 0.0),
+            },
+            "monte_carlo_30d": {
+                "expected_price": _to_float(mc30.get("expected_price", 0), 0.0),
+                "prob_up_10%": _to_float(mc30.get("prob_up_10%", 0), 0.0),
+                "prob_down_10%": _to_float(mc30.get("prob_down_10%", 0), 0.0),
+            },
+            "mean_reversion": {
+                "mean_price": _to_float(mr.get("mean", 0), 0.0),
+                "deviation_std": _to_float(mr.get("zscore", 0), 0.0),
+            },
+            "fibonacci": {
+                "zone": fib_zone,
+                "bias": fib_bias,
+            },
+            "returns_analysis": {
+                "annual_volatility": annual_vol,
+            },
+            "monte_carlo_bias": _to_float(mc7.get("bias", 0), 0.0),
+            "mean_reversion_signal": _to_float(mr.get("signal", 0), 0.0),
+            "arima_trend": _to_float(arima.get("trend", 0), 0.0),
+            "fibonacci_signal": _to_float(fib_signal, 0.0),
+            "volatility_regime": vol_regime,
+        }
+    
+    correlation = None
+    if returns_by_asset:
+        try:
+            returns_df = pd.DataFrame(returns_by_asset).dropna(how='any')
+            if not returns_df.empty:
+                raw_corr = returns_df.corr().round(2).to_dict()
+                correlation = {
+                    k: {kk: _to_float(vv, 0.0) for kk, vv in v.items()}
+                    for k, v in raw_corr.items()
+                }
+        except Exception as e:
+            print(f"Quant correlation error: {e}")
+    
+    return results, correlation
+
+async def get_btc_7d_change() -> float:
+    """Get BTC 7d change % using daily candles."""
+    df_daily = await fetch_ohlcv("PF_XBTUSD", TIMEFRAME_DAILY, 8)
+    if df_daily is None or len(df_daily) < 8:
+        return 0.0
+    start_price = df_daily['close'].iloc[-8]
+    end_price = df_daily['close'].iloc[-1]
+    if start_price <= 0:
+        return 0.0
+    return (end_price - start_price) / start_price * 100
 
 # ================================
 # MACRO ANALYSIS (4H) - Big Picture
@@ -4065,6 +6075,8 @@ def pullback_complete_short(df, ema21_val):
     
     close = df['close']
     current_price = close.iloc[-1]
+    rsi_series = RSIIndicator(close, window=14).rsi()
+    rsi_val = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50
     
     # 1. Kaina turi būti žemiau EMA21 (pullback pasibaigęs)
     if current_price >= ema21_val:
@@ -4223,45 +6235,65 @@ def get_integrated_score(symbol: str, df_htf, df_ltf, base_direction: str, base_
         print(f"Pro analysis error: {e}")
     
     quant_bias_value = 0  # v8.9.2: Track quant bias for counter-trend logic
-    try:
-        if asset_name in quant_results and quant_results[asset_name]:
-            quant_bias, quant_signals = quant_engine.get_quant_signal_bias(quant_results[asset_name])
-            quant_bias_value = quant_bias  # Store for return
-            
-            if base_direction == "LONG" and quant_bias > 0:
-                adjustment = min(20, quant_bias)
-                total_adjustment += adjustment
-                adjustments.extend([s for s in quant_signals[:2]])
-                confidence_factors.append(('QUANT', min(1.0, abs(quant_bias) / 30)))
-            elif base_direction == "SHORT" and quant_bias < 0:
-                adjustment = min(20, abs(quant_bias))
-                total_adjustment += adjustment
-                adjustments.extend([s for s in quant_signals[:2]])
-                confidence_factors.append(('QUANT', min(1.0, abs(quant_bias) / 30)))
-            elif quant_bias != 0:
-                total_adjustment -= 10
-                adjustments.append("QUANT_CONFLICT")
-    except Exception as e:
-        print(f"Quant integration error: {e}")
+    if QUANT_DIRECTION_ENABLED:
+        try:
+            if asset_name in quant_results and quant_results[asset_name]:
+                quant_bias, quant_signals = quant_engine.get_quant_signal_bias(quant_results[asset_name])
+                quant_bias_value = quant_bias  # Store for return
+                
+                if base_direction == "LONG" and quant_bias > 0:
+                    adjustment = min(20, quant_bias)
+                    total_adjustment += adjustment
+                    adjustments.extend([s for s in quant_signals[:2]])
+                    confidence_factors.append(('QUANT', min(1.0, abs(quant_bias) / 30)))
+                elif base_direction == "SHORT" and quant_bias < 0:
+                    adjustment = min(20, abs(quant_bias))
+                    total_adjustment += adjustment
+                    adjustments.extend([s for s in quant_signals[:2]])
+                    confidence_factors.append(('QUANT', min(1.0, abs(quant_bias) / 30)))
+                elif quant_bias != 0:
+                    total_adjustment -= 10
+                    adjustments.append("QUANT_CONFLICT")
+        except Exception as e:
+            print(f"Quant integration error: {e}")
     
+    intel_weight = 1.0
+    intel_bias = None
+    try:
+        intel = market_intel_results.get(symbol) if isinstance(market_intel_results, dict) else None
+        if intel:
+            intel_bias = intel.get("bias")
+            intel_structure = intel.get("structure")
+            if intel_bias == base_direction and intel_structure in ("HH_HL", "LL_LH"):
+                intel_weight = 1.25
+            elif intel_bias == base_direction:
+                intel_weight = 1.15
+            elif intel_bias in ("LONG", "SHORT") and intel_bias != base_direction:
+                intel_weight = 0.7
+    except Exception:
+        pass
+
     try:
         sentiment_data = sentiment_analyzer.get_reddit_sentiment(asset_name)
         sentiment_score = sentiment_data.get('sentiment_score', 0)
         
         if base_direction == "LONG" and sentiment_score > 0.1:
-            adjustment = min(10, int(sentiment_score * 30))
+            base_adj = min(10, int(sentiment_score * 30))
+            adjustment = int(base_adj * intel_weight)
             total_adjustment += adjustment
             adjustments.append(f"SENTIMENT_{sentiment_data.get('sentiment_label', 'BULLISH')}")
-            confidence_factors.append(('SENTIMENT', min(1.0, abs(sentiment_score) * 2)))
+            confidence_factors.append(('SENTIMENT', min(1.0, abs(sentiment_score) * 2 * intel_weight)))
         elif base_direction == "SHORT" and sentiment_score < -0.1:
-            adjustment = min(10, int(abs(sentiment_score) * 30))
+            base_adj = min(10, int(abs(sentiment_score) * 30))
+            adjustment = int(base_adj * intel_weight)
             total_adjustment += adjustment
             adjustments.append(f"SENTIMENT_{sentiment_data.get('sentiment_label', 'BEARISH')}")
-            confidence_factors.append(('SENTIMENT', min(1.0, abs(sentiment_score) * 2)))
+            confidence_factors.append(('SENTIMENT', min(1.0, abs(sentiment_score) * 2 * intel_weight)))
         elif abs(sentiment_score) > 0.2:
             if (base_direction == "LONG" and sentiment_score < -0.2) or \
                (base_direction == "SHORT" and sentiment_score > 0.2):
-                total_adjustment -= 5
+                conflict_penalty = 6 if intel_weight >= 1.15 else 4
+                total_adjustment -= conflict_penalty
                 adjustments.append("SENTIMENT_CONFLICT")
     except Exception as e:
         print(f"Sentiment integration error: {e}")
@@ -4272,17 +6304,20 @@ def get_integrated_score(symbol: str, df_htf, df_ltf, base_direction: str, base_
         onchain_score = onchain_data.get('onchain_score', 0)
         
         if base_direction == "LONG" and onchain_signal == "BULLISH":
-            adjustment = min(15, abs(onchain_score) // 2)
+            base_adj = min(15, abs(onchain_score) // 2)
+            adjustment = int(base_adj * intel_weight)
             total_adjustment += adjustment
             adjustments.append("WHALE_ACCUMULATION")
-            confidence_factors.append(('ONCHAIN', min(1.0, abs(onchain_score) / 35)))
+            confidence_factors.append(('ONCHAIN', min(1.0, abs(onchain_score) / 35 * intel_weight)))
         elif base_direction == "SHORT" and onchain_signal == "BEARISH":
-            adjustment = min(15, abs(onchain_score) // 2)
+            base_adj = min(15, abs(onchain_score) // 2)
+            adjustment = int(base_adj * intel_weight)
             total_adjustment += adjustment
             adjustments.append("WHALE_DISTRIBUTION")
-            confidence_factors.append(('ONCHAIN', min(1.0, abs(onchain_score) / 35)))
+            confidence_factors.append(('ONCHAIN', min(1.0, abs(onchain_score) / 35 * intel_weight)))
         elif onchain_signal != 'NEUTRAL':
-            total_adjustment -= 5
+            conflict_penalty = 6 if intel_weight >= 1.15 else 4
+            total_adjustment -= conflict_penalty
             adjustments.append("ONCHAIN_CONFLICT")
     except Exception as e:
         print(f"Onchain integration error: {e}")
@@ -4311,7 +6346,7 @@ def get_integrated_score(symbol: str, df_htf, df_ltf, base_direction: str, base_
 # ================================
 # ORDER FLOW FILTER (v8.9.22)
 # ================================
-def order_flow_filter(df, direction: str) -> tuple:
+def order_flow_filter(df, direction: str, confluence_score: int = 0, relax_level: int = 0) -> tuple:
     """
     Order flow inspired filter:
     - Absorption detection (high volume, small range = accumulation/distribution)
@@ -4351,9 +6386,17 @@ def order_flow_filter(df, direction: str) -> tuple:
         
         # === B. FAKE BREAKOUT ===
         # Big range + low volume = spąstai
+        range_mult = 1.2
+        volume_mult = 1.0
+        if confluence_score >= 60:
+            range_mult = 1.35
+            volume_mult = 0.85
+        if relax_level >= 2:
+            range_mult = max(range_mult, 1.3)
+            volume_mult = min(volume_mult, 0.9)
         fake_breakout = (
-            range_candle > avg_range * 1.2 and
-            volume < avg_volume
+            range_candle > avg_range * range_mult and
+            volume < avg_volume * volume_mult
         )
         
         # === C. FOLLOW-THROUGH ===
@@ -4372,6 +6415,8 @@ def order_flow_filter(df, direction: str) -> tuple:
         
         # === FINAL DECISION ===
         if fake_breakout:
+            if (confluence_score >= 70 or relax_level >= 2) and rejection and (follow_through or absorption):
+                return True, "OF_FAKE_BREAKOUT_BYPASS"
             return False, "OF_FAKE_BREAKOUT"
         
         if absorption and rejection:
@@ -4395,14 +6440,14 @@ def check_1h_rsi_prefilter(df_1h, direction: str, lookback: int = 6) -> tuple:
     Patikrinti ar 1H RSI buvo oversold/overbought per paskutines N valandų.
     
     Logika (pagal The Rumers video):
-    - LONG: 1H RSI buvo <= 32 per paskutines 6 valandas (oversold zona)
-    - SHORT: 1H RSI buvo >= 68 per paskutines 6 valandas (overbought zona)
+    - LONG: 1H RSI buvo <= 40 per paskutines 6 valandas (oversold zona)
+    - SHORT: 1H RSI buvo >= 60 per paskutines 6 valandas (overbought zona)
     
     Returns:
         (bool, str): (ar_praėjo_filtrą, paaiškinimas)
     """
-    if df_1h is None or len(df_1h) < lookback + 14:
-        return True, "1H_RSI_NO_DATA"
+    # RSI filter disabled
+    return True, "RSI_DISABLED"
     
     rsi_1h = calc_rsi(df_1h['close'])
     if rsi_1h is None or len(rsi_1h) < lookback:
@@ -4412,22 +6457,82 @@ def check_1h_rsi_prefilter(df_1h, direction: str, lookback: int = 6) -> tuple:
     min_rsi = rsi_window.min()
     max_rsi = rsi_window.max()
     current_rsi = rsi_1h.iloc[-1]
+    bear_market_active = bool(
+        'bear_engine' in globals()
+        and getattr(bear_engine, 'detector', None)
+        and bear_engine.detector.is_bear_market
+    )
+    
+    long_min, short_max = get_adaptive_rsi_prefilter_thresholds()
     
     if direction == "LONG":
-        was_oversold = min_rsi <= 32
+        was_oversold = min_rsi <= long_min
         if was_oversold:
             return True, f"1H_RSI_OVERSOLD_{min_rsi:.0f}"
         else:
-            return False, f"1H_RSI_NOT_OVERSOLD (min={min_rsi:.0f}, need<=32)"
+            return False, f"1H_RSI_NOT_OVERSOLD (min={min_rsi:.0f}, need<={long_min:.0f})"
     
     elif direction == "SHORT":
-        was_overbought = max_rsi >= 68
+        if bear_market_active:
+            print(f"⚠️ Bear market: Bypassing RSI check for SHORT (RSI: {current_rsi:.0f})")
+            return True, "1H_RSI_SHORT_BYPASS"
+        was_overbought = max_rsi >= short_max
         if was_overbought:
             return True, f"1H_RSI_OVERBOUGHT_{max_rsi:.0f}"
-        else:
-            return False, f"1H_RSI_NOT_OVERBOUGHT (max={max_rsi:.0f}, need>=68)"
+        return False, f"1H_RSI_NOT_OVERBOUGHT (max={max_rsi:.0f}, need>={short_max:.0f})"
     
     return True, "1H_RSI_NEUTRAL"
+
+
+def check_directional_rsi_protection(rsi_value: float, direction: str, is_bear_market: bool = False):
+    """
+    Direction-aware RSI protection.
+    """
+    if direction == "LONG":
+        if rsi_value <= 30:
+            return False, "EXTREME_OVERSOLD_WAIT_BULLISH_REVERSAL"
+        return True, "RSI_OK_LONG"
+    if direction == "SHORT":
+        if is_bear_market:
+            if rsi_value > 40:
+                return False, "EXTREME_OVERBOUGHT_WAIT_BEARISH_REJECTION"
+            return True, "RSI_OK_BEAR_SHORT"
+        if rsi_value < 68:
+            return False, "EXTREME_OVERBOUGHT_WAIT_BEARISH_REJECTION"
+        return True, "RSI_OK_BULL_SHORT"
+    return True, "RSI_OK"
+
+
+def evaluate_1h_rsi(rsi_1h: float, direction: str):
+    """
+    Soft RSI filter for DAY / CASHFLOW trading.
+    Returns: (allowed: bool, penalty: int, reason: str)
+    penalty = score reduction (0 = none)
+    """
+    return True, 0, "RSI_DISABLED"
+
+
+def evaluate_short_rsi_flow(rsi: float, trend: str):
+    """
+    CASHFLOW / TREND SHORT RSI logic.
+    Returns (allowed: bool, reason: str | None)
+    """
+    if trend not in ("BEAR", "STRONG_BEAR"):
+        return True, None
+
+    if rsi < 20:
+        return False, "RSI_EXHAUSTION_BLOCK (<20)"
+
+    if 25 <= rsi < 35:
+        return True, "RSI_TREND_CONTINUATION_CAUTION (25-35)"
+
+    if 35 <= rsi <= 60:
+        return True, "RSI_TREND_CONTINUATION_OK (35-60)"
+
+    if rsi > 60:
+        return True, "RSI_BEARISH_REJECTION_ZONE (>60)"
+
+    return True, None
 
 
 # ================================
@@ -4642,11 +6747,68 @@ def check_multi_indicator_confluence(df, df_1h, df_htf, direction: str) -> tuple
 
 
 # ================================
+# STRATEGY DETERMINATION
+# ================================
+def determine_strategy_name(signals: list, trend: str, is_countertrend: bool = False) -> str:
+    """
+    Determine strategy name from signal characteristics
+    
+    Args:
+        signals: List of signal strings
+        trend: Current trend (BULL, BEAR, etc.)
+        is_countertrend: Whether this is a counter-trend trade
+    
+    Returns:
+        Strategy name from STRATEGY_LIST
+    """
+    signals_str = " ".join(signals).upper()
+    
+    # COUNTER_TREND: Explicit counter-trend signals
+    if is_countertrend or "COUNTER_TREND" in signals_str or "QUANT_COUNTER_TREND" in signals_str:
+        return "COUNTER_TREND"
+    
+    # BREAKOUT: Structure breaks, momentum reversals, liquidity sweeps
+    if any(sig in signals_str for sig in ["STRUCTURE_BULL", "STRUCTURE_BEAR", "MOMENTUM_REVERSAL", 
+                                          "LIQUIDITY_SWEEP", "BREAKOUT", "SFP"]):
+        return "BREAKOUT"
+    
+    # PULLBACK: Pullback completion signals
+    if "PULLBACK" in signals_str or "PULLBACK_COMPLETE" in signals_str:
+        return "PULLBACK"
+    
+    # SCALP_REBOUND: Rebound from oversold/overbought, RSI extremes
+    if any(sig in signals_str for sig in ["REBOUND", "RSI_OVERSOLD", "RSI_OVERBOUGHT", "SCALP"]):
+        return "SCALP_REBOUND"
+    
+    # TREND_CONTINUATION: Default for trend-following trades
+    return "TREND_CONTINUATION"
+
+
+# ================================
 # ENTRY SIGNAL GENERATION (15min)
 # ================================
-def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h=None, quant_bias=0):
+def generate_entry_signal(
+    symbol,
+    df,
+    trend,
+    df_htf=None,
+    macro_data=None,
+    df_1h=None,
+    df_daily=None,
+    df_weekly=None,
+    quant_bias=0,
+    demand_zone=None,
+    supply_zone=None,
+    in_demand_zone=False,
+    in_supply_zone=False,
+    near_demand_zone=False,
+    near_supply_zone=False,
+):
     if df is None or len(df) < 50:
         return None
+
+    if not QUANT_ENABLED:
+        quant_bias = 0
     
     close = df['close']
     current_price = close.iloc[-1]
@@ -4674,14 +6836,14 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
     long_signals = []
     short_signals = []
     
-    # v8.9.3: QUANT BIAS INTEGRATION
-    # Add mathematical analysis score to entry signal generation
-    if quant_bias >= 15:
-        long_score += quant_bias  # +15 to +25 for strong LONG bias
-        long_signals.append(f"QUANT_LONG_{quant_bias}")
-    elif quant_bias <= -15:
-        short_score += abs(quant_bias)  # +15 to +25 for strong SHORT bias
-        short_signals.append(f"QUANT_SHORT_{abs(quant_bias)}")
+    # v8.9.3: QUANT BIAS INTEGRATION (disabled for direction in Phase 1)
+    if QUANT_DIRECTION_ENABLED:
+        if quant_bias >= 15:
+            long_score += quant_bias  # +15 to +25 for strong LONG bias
+            long_signals.append(f"QUANT_LONG_{quant_bias}")
+        elif quant_bias <= -15:
+            short_score += abs(quant_bias)  # +15 to +25 for strong SHORT bias
+            short_signals.append(f"QUANT_SHORT_{abs(quant_bias)}")
     
     # 4H Macro confluence (if provided)
     if macro_data:
@@ -4811,7 +6973,7 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
     full_bear_alignment = macro_confirms_short and trend_confirms_short
     
     # Momentum reversal: price must be falling significantly
-    momentum_reversal_short = price_change_5 < -0.008  # At least -0.8% drop (stricter)
+    momentum_reversal_short = price_change_5 < -0.003  # At least -0.3% drop (cashflow)
     
     # MACD confirmation: check if MACD is bearish
     from ta.trend import MACD as MACD_Indicator
@@ -4820,13 +6982,332 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
     macd_signal = macd_indicator.macd_signal().iloc[-1]
     macd_bearish = macd_line < macd_signal  # MACD below signal = bearish
     
-    # For SHORT: require full alignment (4H+1H BEAR) AND MACD bearish confirmation
-    # v8.1: Stricter - MACD must confirm, momentum reversal adds bonus but not required
-    short_confirmed = short_candle_ok and full_bear_alignment and macd_bearish
+    # For SHORT: require full alignment (4H+1H BEAR) and confirm via MACD or momentum
+    short_confirmed = short_candle_ok and full_bear_alignment and (macd_bearish or momentum_reversal_short)
     
+    # HTF market state + location context (global decision tree)
+    htf_supply_zone = None
+    htf_demand_zone = None
+    in_supply_zone = False
+    in_demand_zone = False
+    location_state = "MID_RANGE"
+    zone_accepted = False
+    next_candle_bullish = False
+    zone_source = None
+    if df_htf is not None and len(df_htf) >= 20:
+        try:
+            atr_htf = calc_atr(df_htf).iloc[-1]
+            htf_blocks = OrderBlocks.detect_htf_order_blocks(df_htf, atr_htf, impulse_mult=ZONE_IMPULSE_MULT)
+            for ob in htf_blocks:
+                zone_type = OrderBlocks.classify_zone(ob)
+                if ob.contains_price(current_price):
+                    if zone_type == "SUPPLY":
+                        in_supply_zone = True
+                        htf_supply_zone = ob
+                        htf_supply_zone.atr = atr_htf
+                    if zone_type == "DEMAND":
+                        in_demand_zone = True
+                        htf_demand_zone = ob
+                        htf_demand_zone.atr = atr_htf
+            if htf_supply_zone:
+                if current_price > htf_supply_zone.top:
+                    location_state = "ABOVE_SUPPLY"
+                else:
+                    location_state = "AT_SUPPLY"
+                zone_source = "HTF"
+            elif htf_demand_zone:
+                if current_price < htf_demand_zone.bottom:
+                    location_state = "BELOW_DEMAND"
+                else:
+                    location_state = "AT_DEMAND"
+                zone_source = "HTF"
+        except Exception:
+            pass
+    if zone_source is None and df is not None and len(df) >= 20:
+        try:
+            atr_ltf = calc_atr(df).iloc[-1]
+            ltf_blocks = OrderBlocks.detect_htf_order_blocks(df, atr_ltf, impulse_mult=ZONE_IMPULSE_MULT)
+            for ob in ltf_blocks:
+                zone_type = OrderBlocks.classify_zone(ob)
+                if ob.contains_price(current_price):
+                    if zone_type == "SUPPLY" and htf_supply_zone is None:
+                        in_supply_zone = True
+                        htf_supply_zone = ob
+                        htf_supply_zone.atr = atr_ltf
+                        zone_source = "LTF"
+                    if zone_type == "DEMAND" and htf_demand_zone is None:
+                        in_demand_zone = True
+                        htf_demand_zone = ob
+                        htf_demand_zone.atr = atr_ltf
+                        zone_source = "LTF"
+            if zone_source == "LTF":
+                if htf_supply_zone:
+                    location_state = "AT_SUPPLY" if current_price <= htf_supply_zone.top else "ABOVE_SUPPLY"
+                elif htf_demand_zone:
+                    location_state = "AT_DEMAND" if current_price >= htf_demand_zone.bottom else "BELOW_DEMAND"
+        except Exception:
+            pass
+    if location_state == "MID_RANGE" and (not in_supply_zone and not in_demand_zone):
+        location_state = "MID_RANGE"
+
+    structure_result_1h = analyze_market_structure(df_1h, lookback=50) if df_1h is not None else {}
+    no_recent_bos = structure_result_1h.get("structure_break") is None
+    htf_structure = structure_result_1h.get("structure", "NEUTRAL")
+    if htf_structure == "BEARISH":
+        htf_structure = "BEAR"
+    elif htf_structure == "BULLISH":
+        htf_structure = "BULL"
+    else:
+        htf_structure = "RANGE"
+    structure_break = structure_result_1h.get("structure_break")
+    if structure_break == "BULLISH_BREAK":
+        htf_bos = "UP"
+    elif structure_break == "BEARISH_BREAK":
+        htf_bos = "DOWN"
+    else:
+        htf_bos = None
+    market_state = detect_market_state(htf_structure, htf_bos)
+    pullback_result = None
+    if market_state == MarketState.STRONG_BEAR and df is not None and len(df) >= 5:
+        last_swing_high = structure_result_1h.get("last_swing_high")
+        last_swing_low = structure_result_1h.get("last_swing_low")
+        if last_swing_high and last_swing_low:
+            impulse_high = last_swing_high[1]
+            impulse_low = last_swing_low[1]
+            pullback_high = df["high"].iloc[-5:].max()
+            if TRADE_MODE == "SWING":
+                healthy_min, healthy_max, overextended_min = 38, 61, 70
+            else:
+                healthy_min, healthy_max, overextended_min = 30, 70, 70
+            pullback_result = evaluate_pullback(
+                impulse_high=impulse_high,
+                impulse_low=impulse_low,
+                pullback_high=pullback_high,
+                direction="BEAR",
+                healthy_min=healthy_min,
+                healthy_max=healthy_max,
+                overextended_min=overextended_min,
+            )
+
+    # 🔴 Strong bear disables ALL long signal generation
+    if market_state == MarketState.STRONG_BEAR:
+        long_score = -9999
+
+    if htf_supply_zone and len(df) >= 2:
+        zone_high = htf_supply_zone.top
+        breakout_candle = df.iloc[-2]
+        confirm_candle = df.iloc[-1]
+        breakout_range = breakout_candle["high"] - breakout_candle["low"]
+        breakout_body = abs(breakout_candle["close"] - breakout_candle["open"])
+        breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+        zone_accepted = (breakout_candle["close"] > zone_high) and (breakout_body_pct >= 0.6)
+        next_candle_bullish = confirm_candle["close"] >= confirm_candle["open"]
+    demand_breakout_ok = False
+    next_candle_bearish = False
+    if htf_demand_zone and len(df) >= 2:
+        zone_low = htf_demand_zone.bottom
+        breakout_candle = df.iloc[-2]
+        confirm_candle = df.iloc[-1]
+        breakout_range = breakout_candle["high"] - breakout_candle["low"]
+        breakout_body = abs(breakout_candle["close"] - breakout_candle["open"])
+        breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+        demand_breakout_ok = (breakout_candle["close"] < zone_low) and (breakout_body_pct >= 0.6)
+        next_candle_bearish = confirm_candle["close"] <= confirm_candle["open"]
+
+    # HTF S/R context (Daily + Weekly)
+    htf_ctx = None
+    daily_breakout_ok = False
+    weekly_breakout_ok = False
+    if df_daily is not None and len(df_daily) >= 3:
+        daily_high = df_daily["high"].iloc[-3:].max()
+        daily_low = df_daily["low"].iloc[-3:].min()
+        daily_atr = calc_atr(df_daily).iloc[-1] if len(df_daily) >= 15 else 0
+        daily_buffer = daily_atr * 0.25
+        daily_res_low = daily_high - daily_buffer
+        daily_sup_high = daily_low + daily_buffer
+        near_daily_res = daily_res_low <= current_price <= daily_high
+        near_daily_sup = daily_low <= current_price <= daily_sup_high
+    else:
+        daily_high = daily_low = daily_buffer = 0
+        near_daily_res = near_daily_sup = False
+        daily_res_low = daily_sup_high = 0
+
+    if df_weekly is not None and len(df_weekly) >= 1:
+        weekly_high = df_weekly["high"].iloc[-1]
+        weekly_low = df_weekly["low"].iloc[-1]
+        weekly_atr = calc_atr(df_weekly).iloc[-1] if len(df_weekly) >= 15 else 0
+        weekly_buffer = weekly_atr * 0.5
+        weekly_res_low = weekly_high - weekly_buffer
+        weekly_sup_high = weekly_low + weekly_buffer
+        near_weekly_res = weekly_res_low <= current_price <= weekly_high
+        near_weekly_sup = weekly_low <= current_price <= weekly_sup_high
+    else:
+        weekly_high = weekly_low = weekly_buffer = 0
+        near_weekly_res = near_weekly_sup = False
+        weekly_res_low = weekly_sup_high = 0
+
+    nearest_res_dist = None
+    nearest_sup_dist = None
+    if near_weekly_res:
+        nearest_res_dist = abs(weekly_high - current_price) / current_price * 100 if current_price else 0
+    elif near_daily_res:
+        nearest_res_dist = abs(daily_high - current_price) / current_price * 100 if current_price else 0
+    if near_weekly_sup:
+        nearest_sup_dist = abs(current_price - weekly_low) / current_price * 100 if current_price else 0
+    elif near_daily_sup:
+        nearest_sup_dist = abs(current_price - daily_low) / current_price * 100 if current_price else 0
+
+    dominant_barrier = "NONE"
+    if near_weekly_res or near_weekly_sup:
+        dominant_barrier = "WEEKLY"
+    elif near_daily_res or near_daily_sup:
+        dominant_barrier = "DAILY"
+
+    htf_ctx = HTFContext(
+        near_daily_resistance=near_daily_res,
+        near_daily_support=near_daily_sup,
+        near_weekly_resistance=near_weekly_res,
+        near_weekly_support=near_weekly_sup,
+        distance_to_nearest_resistance=nearest_res_dist or 0,
+        distance_to_nearest_support=nearest_sup_dist or 0,
+        dominant_barrier=dominant_barrier,
+    )
+
+    if df is not None and len(df) >= 2:
+        breakout_candle = df.iloc[-2]
+        confirm_candle = df.iloc[-1]
+        breakout_range = breakout_candle["high"] - breakout_candle["low"]
+        breakout_body = abs(breakout_candle["close"] - breakout_candle["open"])
+        breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+        next_bullish = confirm_candle["close"] >= confirm_candle["open"]
+        next_bearish = confirm_candle["close"] <= confirm_candle["open"]
+        if near_daily_res:
+            daily_breakout_ok = (breakout_candle["close"] > daily_high) and (breakout_body_pct >= 0.6) and next_bullish
+        if near_weekly_res:
+            weekly_breakout_ok = (breakout_candle["close"] > weekly_high) and (breakout_body_pct >= 0.6) and next_bullish
+        if near_daily_sup:
+            daily_breakout_ok = (breakout_candle["close"] < daily_low) and (breakout_body_pct >= 0.6) and next_bearish
+        if near_weekly_sup:
+            weekly_breakout_ok = (breakout_candle["close"] < weekly_low) and (breakout_body_pct >= 0.6) and next_bearish
+
     # v8.2: PULLBACK COMPLETION FILTER - wait for pullback to complete before entry
     pullback_ok_short, pullback_reason_short = pullback_complete_short(df, ema21)
     pullback_ok_long, pullback_reason_long = pullback_complete_long(df, ema21)
+
+    rejection_result = None
+    fake_breakout_result = None
+    entry_delay_result = None
+    if df is not None and len(df) >= 3:
+        rejection_candle = df.iloc[-2]
+        next_candle = df.iloc[-1]
+        prev_candle = df.iloc[-3]
+        into_zone = location_state in ("AT_SUPPLY", "AT_DEMAND")
+        zone_high = None
+        zone_low = None
+        if location_state == "AT_SUPPLY" and htf_supply_zone is not None:
+            zone_high = htf_supply_zone.top
+            zone_low = htf_supply_zone.bottom
+        if location_state == "AT_DEMAND" and htf_demand_zone is not None:
+            zone_high = htf_demand_zone.top
+            zone_low = htf_demand_zone.bottom
+        volume_spike = False
+        if df is not None and len(df) >= 20 and "volume" in df.columns:
+            vol_avg = df["volume"].iloc[-20:].mean()
+            volume_spike = df["volume"].iloc[-2] > (1.5 * vol_avg) if vol_avg else False
+        momentum_loss = False
+        if rsi is not None and len(rsi) >= 3:
+            rsi_now = rsi.iloc[-2]
+            rsi_prev = rsi.iloc[-3]
+            if location_state == "AT_SUPPLY":
+                momentum_loss = rsi_now < rsi_prev
+            elif location_state == "AT_DEMAND":
+                momentum_loss = rsi_now > rsi_prev
+        rejection_context = {
+            "direction": "SHORT" if location_state == "AT_SUPPLY" else "LONG" if location_state == "AT_DEMAND" else None,
+            "location_valid": into_zone,
+            "zone_high": zone_high,
+            "zone_low": zone_low,
+            "atr": atr_val,
+            "volume_spike": volume_spike,
+            "prev_candle_close": prev_candle["close"] if prev_candle is not None else None,
+            "momentum_loss": momentum_loss,
+            "htf_trend": trend,
+            "mode": TRADE_MODE,
+        }
+        if rejection_context["direction"]:
+            rejection_result = evaluate_rejection(
+                rejection_candle,
+                prev_candle,
+                next_candle,
+                rejection_context,
+                rsi_series=rsi,
+            )
+            required_confirms = 2 if TRADE_MODE == "SWING" else 1
+            entry_delay_result = update_entry_delay_state(
+                symbol,
+                rejection_context["direction"],
+                rejection_candle,
+                next_candle,
+                required_confirms,
+            )
+        if location_state == "AT_SUPPLY" and htf_supply_zone is not None:
+            fake_breakout_result = evaluate_fake_breakout(
+                rejection_candle,
+                next_candle,
+                htf_supply_zone,
+                "SHORT",
+            )
+        elif location_state == "AT_DEMAND" and htf_demand_zone is not None:
+            fake_breakout_result = evaluate_fake_breakout(
+                rejection_candle,
+                next_candle,
+                htf_demand_zone,
+                "LONG",
+            )
+
+    # Market regime context
+    consecutive_same_dir = 0
+    if df is not None and len(df) >= 5:
+        last_dirs = []
+        for i in range(-5, 0):
+            last_dirs.append("UP" if df["close"].iloc[i] >= df["open"].iloc[i] else "DOWN")
+        consecutive_same_dir = 1
+        for i in range(len(last_dirs) - 1, 0, -1):
+            if last_dirs[i] == last_dirs[i - 1]:
+                consecutive_same_dir += 1
+            else:
+                break
+
+    atr_pct = (atr_val / current_price * 100) if current_price else 0
+    impulse_body_atr = (abs(df["close"].iloc[-1] - df["open"].iloc[-1]) / atr_val) if atr_val else 0
+    volume_spike = False
+    if df is not None and len(df) >= 20:
+        vol_avg = df["volume"].iloc[-20:].mean()
+        volume_spike = df["volume"].iloc[-1] > (1.5 * vol_avg) if vol_avg else False
+        midrange = (df["high"].iloc[-20:].max() + df["low"].iloc[-20:].min()) / 2
+    else:
+        midrange = current_price
+    close_above_midrange = current_price > midrange
+    close_below_midrange = current_price < midrange
+    structure_broken = structure_result_1h.get("structure_break") is not None
+
+    regime_ctx = DecisionRegimeContext(
+        rsi=rsi_val,
+        atr_pct=atr_pct,
+        impulse_body_atr=impulse_body_atr,
+        volume_spike=volume_spike,
+        consecutive_same_dir=consecutive_same_dir,
+        structure_broken=structure_broken,
+        close_above_midrange=close_above_midrange,
+        close_below_midrange=close_below_midrange,
+    )
+    signal_regime = detect_regime_ctx(regime_ctx) if regime_ctx is not None else None
+
+    expansion_ctx = {
+        "consecutive_candles": consecutive_same_dir,
+        "pullback_depth_pct": max(0.0, (df["high"].iloc[-20:].max() - current_price) / max((df["high"].iloc[-20:].max() - df["low"].iloc[-20:].min()), 1e-9) * 100) if df is not None and len(df) >= 20 else 0,
+        "atr_pct": atr_pct,
+    }
     
     # v8.2: VOLUME CONFIRMATION
     volume_ok, volume_reason = check_volume_confirmation(df, "SHORT" if short_score > long_score else "LONG")
@@ -4836,15 +7317,41 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
     atr_multiplier = get_volatility_adjusted_atr_multiplier(df_htf, vix_value)
     sl_distance = atr_val * atr_multiplier  # Dynamic based on volatility
     
-    # For LONG in BEAR market: allow if RSI <= RSI_OVERSOLD OR quant_bias >= 15 (v8.9.3)
+    # For LONG in BEAR market: allow if RSI <= RSI_OVERSOLD (Quant disabled for direction)
     long_in_bear_ok = rsi_val <= RSI_OVERSOLD
-    quant_counter_trend = quant_bias >= 15  # v8.9.3: Quant-confirmed counter-trend
+    quant_counter_trend = QUANT_DIRECTION_ENABLED and quant_bias >= 15  # v8.9.3: Quant-confirmed counter-trend
+
+    # Counter-trend extras: allow with strong confluence or support bounce
+    support_bounce_ct = False
+    confluence_score_long = 0
+    confluence_ct = False
+    support_ct = False
+    if trend in ["STRONG_BEAR", "BEAR"]:
+        support_bounce_ct, _support_dist = detect_support_bounce(
+            df_1h, current_price, relax_level=get_adaptive_relax_level()
+        )
+        confluence_score_long, _bypass_long, _reasons_long = check_multi_indicator_confluence(
+            df, df_1h, df_htf, "LONG"
+        )
+        support_ct = support_bounce_ct and long_candle_ok and rsi_val <= 50
+        confluence_ct = confluence_score_long >= 65 and long_candle_ok and rsi_val <= 45
+    ct_override_allowed = support_ct or confluence_ct
+    allow_aggressive_ct = QUANT_DIRECTION_ENABLED and quant_counter_trend and quant_bias >= 20
+
+    # 🟢 Contrarian LONG only in RANGE with no recent BOS
+    contrarian_allowed = (market_state == MarketState.RANGE) and no_recent_bos
+    if TRADE_MODE == "CASHFLOW":
+        contrarian_allowed = False
+    if not contrarian_allowed:
+        quant_counter_trend = False
+        long_in_bear_ok = False
+        ct_override_allowed = False
     
     # v8.9.4: Check if counter-trend is auto-disabled due to poor performance
     ct_stats = get_counter_trend_stats()
     if ct_stats["ct_disabled"]:
         quant_counter_trend = False  # Disable counter-trend signals
-        if quant_bias >= 15:
+        if QUANT_DIRECTION_ENABLED and quant_bias >= 15:
             print(f"  ⚠️ {symbol}: Counter-trend DISABLED (win rate: {ct_stats['ct_win_rate']}%, {ct_stats['ct_total']} trades)")
     
     # v8.9.6: Counter-trend requires MANDATORY Candle Reversal pattern (The Rumers style)
@@ -4853,14 +7360,65 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
     has_candle_reversal = False
     candle_rev_pattern = None
     
-    # v8.9.24: REBOUND ENTRY REFINER - Check for score/RR boost in BEAR markets
+    # ================================
+    # STRATEGY HEALTH CHECK (FIRST - BEFORE REBOUND REFINER)
+    # ================================
+    # Determine preliminary strategy for health check (rebound is for LONG in BEAR = COUNTER_TREND or SCALP_REBOUND)
+    preliminary_strategy = None
+    rebound_allowed = False
+    size_multiplier = 1.0
+    health_status = None  # Store health status for additional safety check
+    
+    if trend in ["BEAR", "STRONG_BEAR"]:
+        # Rebound refiner applies to LONG signals in BEAR markets
+        # Strategy would be COUNTER_TREND or SCALP_REBOUND depending on signals
+        if long_in_bear_ok or quant_counter_trend:
+            preliminary_strategy = "COUNTER_TREND"
+        elif rsi_val <= 30:
+            preliminary_strategy = "SCALP_REBOUND"
+        else:
+            preliminary_strategy = "COUNTER_TREND"  # Default for LONG in BEAR
+        
+        # Check strategy health FIRST
+        health = strategy_health_engine.evaluate_strategy(preliminary_strategy)
+        health_status = health.status  # Store for additional safety check
+        
+        if health.status == "DISABLED":
+            # Strategy is disabled - block signal generation entirely
+            print(f"  🚫 {symbol}: Strategy {preliminary_strategy} is DISABLED - {health.reason}")
+            return None  # Block signal generation
+        elif health.status == "WARNING":
+            size_multiplier = 0.5
+            rebound_allowed = False  # WARNING = no rebound allowed
+            print(f"  ⚠️ {symbol}: Strategy {preliminary_strategy} is WARNING - Rebound disabled, size reduced 50%")
+        else:
+            size_multiplier = 1.0
+            rebound_allowed = True
+        
+        # Additional conditions to disable rebound
+        if circuit_state.get("consecutive_losses", 0) >= 2:
+            rebound_allowed = False
+            print(f"  ⚠️ {symbol}: Rebound disabled - {circuit_state.get('consecutive_losses', 0)} consecutive losses")
+        
+        # Check daily limit proximity
+        balance = get_available_balance()
+        capital = balance.get("total_usd", 0)
+        if capital > 0:
+            daily_limit = capital * (DAILY_LOSS_LIMIT_PCT / 100)
+            if auto_trading_state.get("daily_pnl", 0) < -0.5 * daily_limit:
+                rebound_allowed = False
+                print(f"  ⚠️ {symbol}: Rebound disabled - Daily P&L near limit (${auto_trading_state.get('daily_pnl', 0):.2f} < -${0.5 * daily_limit:.2f})")
+    
+    # ================================
+    # REBOUND ENTRY REFINER (ONLY IF ALLOWED)
+    # ================================
     has_bullish_divergence = detect_rsi_divergence(df_1h, direction="LONG") if df_1h is not None else False
     rebound_refiner_result = None
     atr_ratio = 1.0
     rebound_score_boost = 0
     rebound_rr_improvement = 1.0
     
-    if trend in ["BEAR", "STRONG_BEAR"]:
+    if trend in ["BEAR", "STRONG_BEAR"] and rebound_allowed:
         # Calculate ATR ratio (current vs average)
         try:
             atr_series = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
@@ -4873,8 +7431,11 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
         # Check for bullish 5m close
         bullish_candle_close = df['close'].iloc[-1] > df['open'].iloc[-1]
         
+        # Get market regime
+        MARKET_REGIME = market_regime_state.get("regime", "NEUTRAL")
+        
         rebound_ctx = ReboundRefinerContext(
-            market_regime="BEAR",
+            market_regime=MARKET_REGIME,
             rsi=rsi_val,
             atr_ratio=atr_ratio,
             has_bullish_divergence=has_bullish_divergence,
@@ -4883,100 +7444,115 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
         )
         rebound_refiner_result = evaluate_rebound_refiner(rebound_ctx)
         
-        if rebound_refiner_result.active:
-            rebound_score_boost = rebound_refiner_result.score_boost
-            rebound_rr_improvement = rebound_refiner_result.rr_improvement
-            print(f"  📈 {symbol}: REBOUND REFINER +{rebound_score_boost}pts, R:R×{rebound_rr_improvement:.2f} ({rebound_refiner_result.reason})")
-            long_signals.append(f"REBOUND_BOOST+{rebound_score_boost}")
+        # Additional safety check: If Rebound is active AND Strategy Health = WARNING → Don't allow rebound boost
+        if rebound_refiner_result and rebound_refiner_result.active:
+            if health_status == "WARNING":
+                print(f"  ⚠️ {symbol}: REBOUND REFINER blocked - Strategy Health is WARNING (safety check)")
+                rebound_score_boost = 0
+                rebound_rr_improvement = 1.0
+            else:
+                rebound_score_boost = rebound_refiner_result.score_boost
+                rebound_rr_improvement = rebound_refiner_result.rr_improvement
+                print(f"  📈 {symbol}: REBOUND REFINER +{rebound_score_boost}pts, R:R×{rebound_rr_improvement:.2f} ({rebound_refiner_result.reason})")
+                long_signals.append(f"REBOUND_BOOST+{rebound_score_boost}")
     
     # Legacy compatibility (empty result for non-BEAR)
     scalp_rebound_result = None
     
-    # v8.9.6: Check for candle reversal pattern for ANY counter-trend LONG (quant or extreme oversold)
-    counter_trend_possible = (quant_counter_trend or long_in_bear_ok) and rsi_val <= 40
-    if counter_trend_possible:
-        # Check for bullish reversal patterns in current timeframe
-        # Patterns: Bullish Engulfing, Hammer (lower wick > 2x body), Dragonfly Doji
-        open_price = df['open'].iloc[-1]
-        close_price = df['close'].iloc[-1]
-        high_price = df['high'].iloc[-1]
-        low_price = df['low'].iloc[-1]
-        prev_open = df['open'].iloc[-2]
-        prev_close = df['close'].iloc[-2]
-        
-        body = abs(close_price - open_price)
-        upper_wick = high_price - max(open_price, close_price)
-        lower_wick = min(open_price, close_price) - low_price
-        total_range = high_price - low_price
-        
-        is_bullish = close_price > open_price
-        prev_bearish = prev_close < prev_open
-        
-        # Bullish Engulfing: current bullish candle engulfs previous bearish
-        if is_bullish and prev_bearish and close_price > prev_open and open_price < prev_close:
-            has_candle_reversal = True
-            candle_rev_pattern = "BULLISH_ENGULFING"
-        
-        # Hammer: lower wick > 2x body, small upper wick
-        elif is_bullish and lower_wick > body * 2 and upper_wick < body * 0.5 and body > 0:
-            has_candle_reversal = True
-            candle_rev_pattern = "HAMMER"
-        
-        # Dragonfly Doji: very small body, long lower wick
-        elif total_range > 0 and body < total_range * 0.1 and lower_wick > total_range * 0.6:
-            has_candle_reversal = True
-            candle_rev_pattern = "DRAGONFLY_DOJI"
-        
-        # Morning Star (3 candle): bearish, small body, bullish closing above midpoint
-        if len(df) >= 3 and not has_candle_reversal:
-            candle_3_ago = df.iloc[-3]
-            candle_2_ago = df.iloc[-2]
-            candle_1 = df.iloc[-1]
-            
-            first_bearish = candle_3_ago['close'] < candle_3_ago['open']
-            second_small = abs(candle_2_ago['close'] - candle_2_ago['open']) < abs(candle_3_ago['close'] - candle_3_ago['open']) * 0.5
-            third_bullish = candle_1['close'] > candle_1['open']
-            midpoint = (candle_3_ago['open'] + candle_3_ago['close']) / 2
-            
-            if first_bearish and second_small and third_bullish and candle_1['close'] > midpoint:
-                has_candle_reversal = True
-                candle_rev_pattern = "MORNING_STAR"
-    
-    # v8.9.6: Block ALL counter-trend LONGs without candle reversal confirmation
-    # This applies to both quant_counter_trend AND long_in_bear_ok (extreme oversold)
-    if not has_candle_reversal:
-        if quant_counter_trend:
-            quant_counter_trend = False
-            if rsi_val <= 40:
-                print(f"  ⚠️ {symbol}: Counter-trend blocked - waiting for candle reversal (RSI={rsi_val:.0f})")
-            else:
-                print(f"  ⚠️ {symbol}: Counter-trend blocked - RSI too high ({rsi_val:.0f} > 40)")
-        if long_in_bear_ok:
-            long_in_bear_ok = False  # v8.9.6: Also block extreme oversold without reversal
-            print(f"  ⚠️ {symbol}: Extreme oversold blocked - waiting for candle reversal (RSI={rsi_val:.0f})")
-    
-    # v8.9.22: OB/FVG ZONE CHECK - Counter-trend MUST be at key zone
-    # Professional rules: "Entry must be at Order Block or FVG zone"
+    # v8.9.6: Check for candle reversal pattern for ANY counter-trend LONG
+    counter_trend_long_mode = long_score >= short_score
     is_at_key_zone = False
     key_zone_type = None
-    if has_candle_reversal and (quant_counter_trend or long_in_bear_ok):
-        zone_check = OrderBlocks.is_price_at_key_zone(df, 'LONG', tolerance_pct=0.8)
-        is_at_key_zone = zone_check.get('is_at_zone', False)
-        key_zone_type = zone_check.get('zone_type')
+    if counter_trend_long_mode:
+        ct_rsi_limit = 50 if ct_override_allowed else 40
+        counter_trend_possible = (
+            (quant_counter_trend or long_in_bear_ok or ct_override_allowed)
+            and rsi_val <= ct_rsi_limit
+        )
+        if counter_trend_possible:
+            # Check for bullish reversal patterns in current timeframe
+            # Patterns: Bullish Engulfing, Hammer (lower wick > 2x body), Dragonfly Doji
+            open_price = df['open'].iloc[-1]
+            close_price = df['close'].iloc[-1]
+            high_price = df['high'].iloc[-1]
+            low_price = df['low'].iloc[-1]
+            prev_open = df['open'].iloc[-2]
+            prev_close = df['close'].iloc[-2]
+            
+            body = abs(close_price - open_price)
+            upper_wick = high_price - max(open_price, close_price)
+            lower_wick = min(open_price, close_price) - low_price
+            total_range = high_price - low_price
+            
+            is_bullish = close_price > open_price
+            prev_bearish = prev_close < prev_open
+            
+            # Bullish Engulfing: current bullish candle engulfs previous bearish
+            if is_bullish and prev_bearish and close_price > prev_open and open_price < prev_close:
+                has_candle_reversal = True
+                candle_rev_pattern = "BULLISH_ENGULFING"
+            
+            # Hammer: lower wick > 2x body, small upper wick
+            elif is_bullish and lower_wick > body * 2 and upper_wick < body * 0.5 and body > 0:
+                has_candle_reversal = True
+                candle_rev_pattern = "HAMMER"
+            
+            # Dragonfly Doji: very small body, long lower wick
+            elif total_range > 0 and body < total_range * 0.1 and lower_wick > total_range * 0.6:
+                has_candle_reversal = True
+                candle_rev_pattern = "DRAGONFLY_DOJI"
+            
+            # Morning Star (3 candle): bearish, small body, bullish closing above midpoint
+            if len(df) >= 3 and not has_candle_reversal:
+                candle_3_ago = df.iloc[-3]
+                candle_2_ago = df.iloc[-2]
+                candle_1 = df.iloc[-1]
+                
+                first_bearish = candle_3_ago['close'] < candle_3_ago['open']
+                second_small = abs(candle_2_ago['close'] - candle_2_ago['open']) < abs(candle_3_ago['close'] - candle_3_ago['open']) * 0.5
+                third_bullish = candle_1['close'] > candle_1['open']
+                midpoint = (candle_3_ago['open'] + candle_3_ago['close']) / 2
+                
+                if first_bearish and second_small and third_bullish and candle_1['close'] > midpoint:
+                    has_candle_reversal = True
+                    candle_rev_pattern = "MORNING_STAR"
         
-        if not is_at_key_zone:
-            if quant_counter_trend:
+        # v8.9.6: Block ALL counter-trend LONGs without candle reversal confirmation
+        # This applies to both quant_counter_trend AND long_in_bear_ok (extreme oversold)
+        if not has_candle_reversal:
+            if quant_counter_trend and not allow_aggressive_ct:
                 quant_counter_trend = False
-                print(f"  ⚠️ {symbol}: Counter-trend blocked - not at OB/FVG zone (need key zone for counter-trend)")
+                print(f"  ⚠️ {symbol}: Counter-trend blocked - no bullish reversal candle (RSI={rsi_val:.0f})")
             if long_in_bear_ok:
-                long_in_bear_ok = False
-                print(f"  ⚠️ {symbol}: Extreme oversold blocked - not at OB/FVG zone")
+                long_in_bear_ok = False  # v8.9.6: Also block extreme oversold without reversal
+                print(f"  ⚠️ {symbol}: Counter-trend blocked - no bullish reversal candle (RSI={rsi_val:.0f})")
+            if ct_override_allowed:
+                ct_override_allowed = False
+                print(f"  ⚠️ {symbol}: Counter-trend blocked - no bullish reversal candle (RSI={rsi_val:.0f})")
+        
+        # v8.9.22: OB/FVG ZONE CHECK - Counter-trend MUST be at key zone
+        # Professional rules: "Entry must be at Order Block or FVG zone"
+        if has_candle_reversal and (long_in_bear_ok or (quant_counter_trend and not allow_aggressive_ct) or ct_override_allowed):
+            zone_check = OrderBlocks.is_price_at_key_zone(df, 'LONG', tolerance_pct=0.8)
+            is_at_key_zone = zone_check.get('is_at_zone', False)
+            key_zone_type = zone_check.get('zone_type')
+            
+            if not is_at_key_zone:
+                if quant_counter_trend and not allow_aggressive_ct:
+                    quant_counter_trend = False
+                    print(f"  ⚠️ {symbol}: Counter-trend blocked - not at OB/FVG zone")
+                if long_in_bear_ok:
+                    long_in_bear_ok = False
+                    print(f"  ⚠️ {symbol}: Counter-trend blocked - not at OB/FVG zone")
+                if ct_override_allowed:
+                    ct_override_allowed = False
+                    print(f"  ⚠️ {symbol}: Counter-trend blocked - not at OB/FVG zone")
     
     # v8.9.22: 4H CHoCH CONFIRMATION - Counter-trend MUST show structure change on 4H
     # Professional rules: "4H timeframe must confirm potential reversal (CHoCH)"
     # FAIL-SAFE: On any error, block counter-trend (don't allow without confirmation)
     has_4h_choch = False
-    if is_at_key_zone and has_candle_reversal and (quant_counter_trend or long_in_bear_ok):
+    if is_at_key_zone and has_candle_reversal and (long_in_bear_ok or (quant_counter_trend and not allow_aggressive_ct) or ct_override_allowed):
         try:
             df_4h_check = fetch_ohlcv(symbol, '4h', limit=100)
             if df_4h_check is not None and len(df_4h_check) >= 50:
@@ -4984,24 +7560,24 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
                 has_4h_choch = choch_result.get('bullish_choch', False)
                 
                 if not has_4h_choch:
-                    if quant_counter_trend:
+                    if quant_counter_trend and not allow_aggressive_ct:
                         quant_counter_trend = False
-                        print(f"  ⚠️ {symbol}: Counter-trend blocked - no 4H CHoCH (need structure change on 4H)")
+                        print(f"  ⚠️ {symbol}: Counter-trend blocked - no 4H CHoCH confirmation")
                     if long_in_bear_ok:
                         long_in_bear_ok = False
-                        print(f"  ⚠️ {symbol}: Extreme oversold blocked - no 4H CHoCH confirmation")
+                        print(f"  ⚠️ {symbol}: Counter-trend blocked - no 4H CHoCH confirmation")
                 else:
                     print(f"  ✅ {symbol}: 4H CHoCH confirmed for counter-trend LONG")
             else:
                 # FAIL-SAFE: Insufficient data = block counter-trend
-                if quant_counter_trend:
+                if quant_counter_trend and not allow_aggressive_ct:
                     quant_counter_trend = False
                 if long_in_bear_ok:
                     long_in_bear_ok = False
                 print(f"  ⚠️ {symbol}: Counter-trend blocked - insufficient 4H data for CHoCH check")
         except Exception as e:
             # FAIL-SAFE: Any error = block counter-trend (never allow without CHoCH confirmation)
-            if quant_counter_trend:
+            if quant_counter_trend and not allow_aggressive_ct:
                 quant_counter_trend = False
             if long_in_bear_ok:
                 long_in_bear_ok = False
@@ -5045,7 +7621,7 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
     
     if long_score >= effective_min_score_long and effective_candle_ok:
         # Allow LONG in BULL/NEUTRAL trend, OR in BEAR if extreme oversold OR quant confirms counter-trend
-        if trend in ["STRONG_BULL", "BULL", "NEUTRAL"] or (trend in ["STRONG_BEAR", "BEAR"] and (long_in_bear_ok or quant_counter_trend)):
+        if trend in ["STRONG_BULL", "BULL", "NEUTRAL"] or (trend in ["STRONG_BEAR", "BEAR"] and (long_in_bear_ok or quant_counter_trend or ct_override_allowed)):
             base_direction = "LONG"
             base_score = long_score
             base_signals = long_signals
@@ -5058,6 +7634,10 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
                     base_signals.append(f"QUANT_COUNTER_TREND_{quant_bias}")
                     if candle_rev_pattern and "CT_" not in " ".join(base_signals):
                         base_signals.append(f"CT_{candle_rev_pattern}")
+                if support_ct:
+                    base_signals.append("SUPPORT_BOUNCE_CT")
+                if confluence_ct:
+                    base_signals.append("CONFLUENCE_CT")
                 # v8.9.22: Add key zone and 4H CHoCH confirmation to signals
                 if key_zone_type:
                     base_signals.append(f"ZONE_{key_zone_type}")
@@ -5080,8 +7660,248 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
             base_signals.append("PULLBACK_COMPLETE")
         if volume_ok:
             base_signals.append(volume_reason)
-    
+
+    zone_resolution_state = None
+    zone_resolution_reason = None
+    zone_context_type = None
+    zone_resolution_closes = ""
+    zone_resolution_body_pct = 0.0
+
     if base_direction:
+        # Decision engine (market state -> direction gate -> location -> breakout -> indicators)
+        if location_state == "AT_SUPPLY":
+            location_enum = Location.AT_SUPPLY
+        elif location_state == "AT_DEMAND":
+            location_enum = Location.AT_DEMAND
+        elif location_state == "ABOVE_SUPPLY":
+            location_enum = Location.ABOVE_SUPPLY
+        elif location_state == "BELOW_DEMAND":
+            location_enum = Location.BELOW_DEMAND
+        else:
+            location_enum = Location.MID_RANGE
+
+        ema_alignment = "BULL" if ema9 > ema21 else "BEAR"
+        indicator_score_value = indicator_score(rsi_val, ema_alignment, base_direction)
+        indicator_bias = None
+        if base_direction == "LONG" and ema_alignment == "BEAR":
+            indicator_bias = "BLOCK_LONG"
+        if base_direction == "SHORT" and ema_alignment == "BULL":
+            indicator_bias = "BLOCK_SHORT"
+        pullback_state = None
+        if pullback_result and pullback_result.state == "HEALTHY_PULLBACK":
+            pullback_state = "ENTER"
+        recent_impulse = pullback_impulse_states.get(symbol, "NO_IMPULSE") == "HOT"
+        breakout_ok = False
+        if base_direction == "LONG" and location_enum in (Location.AT_SUPPLY, Location.ABOVE_SUPPLY) and htf_supply_zone is not None and len(df) >= 2:
+            breakout_ok = zone_accepted and next_candle_bullish
+        if base_direction == "SHORT" and location_enum in (Location.AT_DEMAND, Location.BELOW_DEMAND) and htf_demand_zone is not None and len(df) >= 2:
+            breakout_ok = demand_breakout_ok and next_candle_bearish
+
+        # HTF S/R gate before decision engine
+        if htf_ctx:
+            htf_allowed, htf_reason, htf_size_mult, htf_conf_mult = evaluate_htf_sr_gate(
+                TRADE_MODE, market_state, base_direction, htf_ctx, daily_breakout_ok, weekly_breakout_ok
+            )
+            if not htf_allowed:
+                print(
+                    f"[HTF_SR] TF={htf_ctx.dominant_barrier} Action=BLOCK_{base_direction} "
+                    f"Reason={htf_reason} DistR={htf_ctx.distance_to_nearest_resistance:.2f}% "
+                    f"DistS={htf_ctx.distance_to_nearest_support:.2f}%"
+                )
+                record_block("HTF_SR")
+                return None
+        else:
+            htf_size_mult = 1.0
+            htf_conf_mult = 1.0
+
+        zone_for_signal = None
+        if base_direction == "LONG" and demand_zone and (in_demand_zone or near_demand_zone):
+            zone_for_signal = demand_zone
+            zone_context_type = "DEMAND"
+        elif base_direction == "SHORT" and supply_zone and (in_supply_zone or near_supply_zone):
+            zone_for_signal = supply_zone
+            zone_context_type = "SUPPLY"
+
+        zone_engine = ZoneResolutionEngine(
+            min_body_pct=ZONE_RESOLUTION_MIN_BODY_PCT,
+            required_closes=ZONE_RESOLUTION_REQUIRED_CLOSES,
+        )
+        zone_state = "OUTSIDE"
+        zone_confidence = 0
+        zone_confirmation = False
+        zone_type_value = None
+        approach_direction = None
+        prev_close = df["close"].iloc[-2] if df is not None and len(df) >= 2 else current_price
+        if current_price is not None and prev_close is not None:
+            approach_direction = "UP" if current_price >= prev_close else "DOWN"
+        if zone_for_signal is not None and ((df_htf is not None and len(df_htf) >= 5) or (df is not None and len(df) >= 5)):
+            data_df = df if zone_source == "LTF" else df_htf
+            atr_for_score = None
+            if data_df is not None and len(data_df) >= 15:
+                atr_for_score = calc_atr(data_df).iloc[-1]
+            zone_age_hours = 0.0
+            impulse_atr = 0.0
+            test_count = 0
+            wick_only = False
+            zone_index = getattr(zone_for_signal, "index", None)
+            zone_type_value = zone_context_type
+            if data_df is not None and zone_index is not None and zone_index < len(data_df):
+                hours_per_candle = 0.25 if zone_source == "LTF" else 4
+                zone_age_hours = float(max(0, (len(data_df) - 1 - zone_index) * hours_per_candle))
+                if atr_for_score:
+                    if zone_context_type == "DEMAND" and zone_index + 1 < len(data_df):
+                        impulse = data_df["high"].iloc[zone_index + 1] - data_df["low"].iloc[zone_index]
+                        impulse_atr = impulse / atr_for_score
+                    if zone_context_type == "SUPPLY" and zone_index + 1 < len(data_df):
+                        impulse = data_df["high"].iloc[zone_index] - data_df["low"].iloc[zone_index + 1]
+                        impulse_atr = impulse / atr_for_score
+                closes = data_df["close"].iloc[zone_index + 1 :]
+                test_count = int(((closes >= zone_for_signal.bottom) & (closes <= zone_for_signal.top)).sum())
+
+            zone_state = "OUTSIDE"
+            if zone_context_type == "SUPPLY":
+                if in_supply_zone:
+                    zone_state = "INSIDE"
+                elif atr_for_score:
+                    buffer_val = 0.25 * atr_for_score
+                    if (zone_for_signal.bottom - buffer_val) <= current_price <= (zone_for_signal.top + buffer_val):
+                        zone_state = "NEAR"
+            if zone_context_type == "DEMAND":
+                if in_demand_zone:
+                    zone_state = "INSIDE"
+                elif atr_for_score:
+                    buffer_val = 0.25 * atr_for_score
+                    if (zone_for_signal.bottom - buffer_val) <= current_price <= (zone_for_signal.top + buffer_val):
+                        zone_state = "NEAR"
+
+            zone_confidence = calculate_zone_confidence(
+                ZoneConfidenceContext(
+                    timeframe="15m" if zone_source == "LTF" else "4h",
+                    age_hours=zone_age_hours,
+                    impulse_atr=impulse_atr,
+                    test_count=test_count,
+                    wick_only=wick_only,
+                )
+            )
+        if zone_for_signal is not None and len(df) >= (zone_engine.required_closes + 1):
+            closed_df = df.iloc[:-1]
+            last_n_df = closed_df.tail(zone_engine.required_closes)
+            candles_15m = [
+                Candle(
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                )
+                for row in last_n_df.to_dict("records")
+            ]
+            zone_type = ZoneType.DEMAND if zone_context_type == "DEMAND" else ZoneType.SUPPLY
+            active_zone = Zone(
+                low=float(zone_for_signal.bottom),
+                high=float(zone_for_signal.top),
+                zone_type=zone_type,
+            )
+            zone_result = zone_engine.resolve(candles_15m, active_zone)
+            zone_resolution_state = zone_result.state
+            zone_resolution_reason = zone_result.reason
+            zone_confirmation = zone_resolution_state in (
+                ZoneResolutionState.CONFIRMED_BREAK,
+                ZoneResolutionState.CONFIRMED_REJECTION,
+            )
+            if candles_15m:
+                zone_resolution_body_pct = candles_15m[-1].body_pct
+                confirmed_closes = 0
+                for c in candles_15m:
+                    if zone_type == ZoneType.SUPPLY:
+                        if c.close > active_zone.high and c.body_pct >= ZONE_RESOLUTION_MIN_BODY_PCT:
+                            confirmed_closes += 1
+                    if zone_type == ZoneType.DEMAND:
+                        if c.close < active_zone.low and c.body_pct >= ZONE_RESOLUTION_MIN_BODY_PCT:
+                            confirmed_closes += 1
+                zone_resolution_closes = f"{confirmed_closes}/{zone_engine.required_closes}"
+            print(
+                f"  → ZONE_RESOLUTION: {zone_resolution_state.value if zone_resolution_state else 'NONE'} | "
+                f"{zone_resolution_reason} | CLOSES={zone_resolution_closes}"
+            )
+
+        accepted, decision_reason, decision_size_mult, decision_conf_mult = evaluate_signal(
+            market_state=market_state,
+            location=location_enum,
+            signal_direction=base_direction,
+            breakout_ok=breakout_ok,
+            indicator_score_value=indicator_score_value,
+            indicator_bias=indicator_bias,
+            rsi_value=rsi_val,
+            pullback_state=pullback_state,
+            recent_impulse=recent_impulse,
+            pullback_result=pullback_result,
+            rejection_result=rejection_result,
+            fake_breakout_result=fake_breakout_result,
+            entry_delay_result=entry_delay_result,
+            zone_resolution_state=zone_resolution_state,
+            zone_state=zone_state,
+            zone_confidence=zone_confidence,
+            zone_confirmation=zone_confirmation,
+            zone_type=zone_type_value,
+            approach_direction=approach_direction,
+            mode=TRADE_MODE,
+            regime_ctx=regime_ctx,
+            expansion_ctx=expansion_ctx,
+        )
+        if pullback_result:
+            print(
+                f"  → PULLBACK_STATE: {pullback_result.state} "
+                f"({pullback_result.retrace_pct:.1f}%) | {pullback_result.reason}"
+            )
+        if fake_breakout_result:
+            print(
+                f"  → FAKE_BREAKOUT: {fake_breakout_result.score} | "
+                f"{fake_breakout_result.reason} ({fake_breakout_result.details})"
+            )
+        if rejection_result:
+            print(
+                f"  → REJECTION_SCORE: {rejection_result.score} | "
+                f"{rejection_result.reason} ({rejection_result.details})"
+            )
+        if entry_delay_result:
+            print(
+                f"  → ENTRY_DELAY: {entry_delay_result.state} | {entry_delay_result.reason}"
+            )
+        log_decision(
+            symbol,
+            base_direction,
+            market_state,
+            decision_reason,
+            zone_resolution=zone_resolution_state,
+            zone_reason=zone_resolution_reason,
+            zone_state=zone_state,
+            zone_confidence=zone_confidence,
+            zone_confirmation=zone_confirmation,
+            zone_source=zone_source,
+            approach_direction=approach_direction,
+            indicator_score=indicator_score_value,
+            indicator_bias=indicator_bias,
+        )
+        if not accepted:
+            record_block("DECISION_ENGINE")
+            return None
+
+        bear_market_active = bool(
+            'bear_engine' in globals()
+            and getattr(bear_engine, 'detector', None)
+            and bear_engine.detector.is_bear_market
+        )
+        rsi_1h_series = calc_rsi(df_1h['close']) if df_1h is not None else None
+        rsi_1h = rsi_1h_series.iloc[-1] if rsi_1h_series is not None and len(rsi_1h_series) > 0 else rsi_val
+        allowed, rsi_penalty, rsi_reason = evaluate_1h_rsi(rsi_1h, base_direction)
+        if not allowed:
+            print(f"  → ⏳ WAIT: RSI filter ({rsi_reason})")
+            record_block("RSI_SOFT_FILTER")
+            return None
+        if rsi_penalty < 0:
+            base_score = max(0, base_score + rsi_penalty)
+            base_signals.append(rsi_reason)
+
         # v8.8: 1H RSI PRE-FILTER (The Rumers inspired)
         # v8.9.3: Skip RSI filter for very strong quant counter-trend (quant_bias >= 25)
         # v8.9.4: Only skip if quant_counter_trend is still enabled (not disabled by safety checks)
@@ -5098,12 +7918,21 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
         
         rsi_filter_ok, rsi_filter_reason = check_1h_rsi_prefilter(df_1h, base_direction, lookback=6)
         if not rsi_filter_ok and not skip_rsi_filter:
-            # v8.9.19: Show confluence score even when blocked
-            if confluence_score >= 40:
-                print(f"  ⚠️ {symbol}: {base_direction} almost bypassed (confluence={confluence_score}/55) - {rsi_filter_reason}")
+            # Allow bypass on strong confluence (cashflow mode)
+            if confluence_score >= 45:
+                skip_rsi_filter = True
+                rsi_filter_reason = f"CONFLUENCE_BYPASS_{confluence_score}"
+                print(f"  ✅ {symbol}: {base_direction} RSI bypassed (confluence={confluence_score}/55, rsi_1h={rsi_1h:.1f})")
+            elif confluence_score >= 40:
+                # Soft bypass with small penalty
+                rsi_filter_reason = f"CONFLUENCE_PENALTY_{confluence_score}"
+                base_score = max(0, base_score - 5)
+                base_signals.append(rsi_filter_reason)
+                print(f"  ⚠️ {symbol}: {base_direction} RSI soft-bypass (confluence={confluence_score}/55, rsi_1h={rsi_1h:.1f}, -5 score)")
             else:
                 print(f"  ❌ {symbol}: {base_direction} blocked by 1H RSI filter - {rsi_filter_reason}")
-            return None
+                record_block("RSI_1H_PREFILTER")
+                return None
         if skip_rsi_filter and not rsi_filter_ok:
             if confluence_bypass:
                 rsi_filter_reason = f"CONFLUENCE_BYPASS_{confluence_score}"  # Mark as confluence-bypassed
@@ -5112,15 +7941,46 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
         
         # v8.9.22: ORDER FLOW FILTER
         # Blocks fake breakouts (big range + low volume = trap)
-        of_filter_ok, of_filter_reason = order_flow_filter(df, base_direction)
+        of_filter_ok, of_filter_reason = order_flow_filter(
+            df,
+            base_direction,
+            confluence_score=confluence_score,
+            relax_level=get_effective_relax_level("ORDER_FLOW")
+        )
         if not of_filter_ok:
             print(f"  ❌ {symbol}: {base_direction} blocked by Order Flow filter - {of_filter_reason}")
+            record_block("ORDER_FLOW")
             return None
+        if of_filter_reason == "OF_FAKE_BREAKOUT_BYPASS":
+            base_score = max(0, base_score - 3)
+            base_signals.append(of_filter_reason)
         
         integrated = get_integrated_score(symbol, df_htf, df, base_direction, base_score)
         
         final_score = integrated['final_score']
         all_signals = base_signals + integrated['signals']
+
+        # Market intel bias alignment
+        intel = market_intel_results.get(symbol) if isinstance(market_intel_results, dict) else None
+        if intel:
+            intel_bias = intel.get("bias")
+            if intel_bias == base_direction:
+                final_score += 3
+                all_signals.append("MI_BIAS_ALIGN")
+            elif intel_bias in ("LONG", "SHORT") and intel_bias != base_direction:
+                final_score -= 4
+                all_signals.append("MI_BIAS_CONFLICT")
+            intel_bos = intel.get("bos")
+            intel_choch = intel.get("choch")
+            if base_direction == "LONG" and intel_bos in ("BOS_UP", "CHOCH_UP"):
+                final_score += 2
+                all_signals.append(f"MI_{intel_bos}")
+            elif base_direction == "SHORT" and intel_bos in ("BOS_DOWN", "CHOCH_DOWN"):
+                final_score += 2
+                all_signals.append(f"MI_{intel_bos}")
+            elif intel_choch in ("CHOCH_UP", "CHOCH_DOWN") and intel_bias in ("LONG", "SHORT") and intel_bias != base_direction:
+                final_score -= 2
+                all_signals.append("MI_CHOCH_CONFLICT")
         
         # v8.9.19: Add confluence signals
         if confluence_bypass:
@@ -5132,7 +7992,7 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
             all_signals.append(rsi_filter_reason.split(" ")[0])  # Add e.g. "1H_RSI_OVERSOLD_32" or "CONFLUENCE_BYPASS_60"
         
         # v8.9.22: Add Order Flow signal
-        if of_filter_reason in ["OF_ABSORPTION_REJECTION", "OF_FOLLOW_THROUGH"]:
+        if of_filter_reason in ["OF_ABSORPTION_REJECTION", "OF_FOLLOW_THROUGH", "OF_FAKE_BREAKOUT_BYPASS"]:
             all_signals.append(of_filter_reason)
         confidence = integrated['confidence']
         
@@ -5153,6 +8013,7 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
             })
             if is_consol:
                 print(f"  🔄 {symbol}: CONSOLIDATION blocked - {', '.join(consol_reasons)}")
+                record_block("CONSOLIDATION")
                 return None
             
             # v8.3: Determine entry type (MARKET vs LIMIT)
@@ -5183,42 +8044,112 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
             except:
                 pass
             
+            # Determine strategy name
+            is_countertrend_flag = trend in ["BEAR", "STRONG_BEAR"] if base_direction == "LONG" else False
+            strategy_name = determine_strategy_name(all_signals, trend, is_countertrend_flag)
+
+            # Support bounce (BEAR longs)
+            support_bounce = False
+            support_distance_pct = None
+            has_bullish_reversal = bool(has_candle_reversal) if base_direction == "LONG" else False
             if base_direction == "LONG":
-                signal = {
-                    "symbol": symbol,
-                    "direction": "LONG",
-                    "score": final_score,
-                    "base_score": base_score,
-                    "signals": all_signals,
-                    "price": current_price,
-                    "sl": current_price - sl_distance,
-                    "tp1": tp1_sr,
-                    "tp2": current_price + tp2_distance,
-                    "tp3": current_price + tp3_distance,
-                    "atr": atr_val,
-                    "rsi": rsi_val,
-                    "trend": trend,
-                    "confidence": confidence,
-                    "modules_used": integrated['modules_used'],
-                    "entry_type": entry_type,
-                    "entry_reason": entry_reason,
-                    "confirmation_count": confirmation_count,
-                    "ml_confidence": ml_confidence,
-                    "quant_bias": integrated.get('quant_bias', 0),  # v8.9.2: For counter-trend
-                    "confluence_score": confluence_score,  # v8.9.19: Multi-indicator confluence
-                    "atr_ratio": atr_ratio,  # v8.9.23: For RR Engine
-                    "is_countertrend": trend in ["BEAR", "STRONG_BEAR"],  # v8.9.23
-                    "rebound_boost": rebound_score_boost,  # v8.9.24: Entry refiner score boost
-                    "rebound_rr_mult": rebound_rr_improvement,  # v8.9.24: R:R improvement
-                    "time": datetime.now(timezone.utc)
-                }
-            else:
-                signal = {
+                support_bounce, support_distance_pct = detect_support_bounce(
+                    df_1h, current_price, relax_level=get_adaptive_relax_level()
+                )
+                if support_bounce and has_bullish_reversal:
+                    all_signals.append("SUPPORT_BOUNCE")
+            
+            # Build signal tags
+            signal_tags = []
+            if trend in ["STRONG_BULL", "BULL"]:
+                signal_tags.append("TREND")
+            elif trend in ["STRONG_BEAR", "BEAR"]:
+                signal_tags.append("COUNTER_TREND")
+            if rebound_refiner_result and rebound_refiner_result.active:
+                signal_tags.append(f"REBOUND:{rebound_refiner_result.reason}")
+            
+            # Apply rebound rr improvement to atr_ratio (used by RR Engine)
+            if rebound_rr_improvement > 1.0:
+                atr_ratio = atr_ratio * rebound_rr_improvement  # Improve effective R:R
+            
+            # Apply decision engine size/confidence adjustments
+            size_multiplier *= decision_size_mult * htf_size_mult
+            confidence = max(0.0, min(1.0, confidence * decision_conf_mult * htf_conf_mult))
+
+        zone_resolution_telemetry = {
+            "zone": zone_context_type or "",
+            "status": "CONFIRMED"
+            if zone_resolution_state in (ZoneResolutionState.CONFIRMED_BREAK, ZoneResolutionState.CONFIRMED_REJECTION)
+            else "UNCONFIRMED",
+            "closes": zone_resolution_closes,
+            "body_pct": round(float(zone_resolution_body_pct), 4),
+        }
+
+        if base_direction == "LONG":
+            holding_time = estimate_holding_time(
+                signal_regime,
+                atr_pct,
+                (tp1_sr - current_price) / current_price * 100 if current_price else 0,
+            )
+            signal = {
+                "symbol": symbol,
+                "direction": "LONG",
+                "score": final_score,
+                "base_score": base_score,
+                "signals": all_signals,
+                "tags": signal_tags,  # Strategy tags for trade statistics
+                "price": current_price,
+                "sl": current_price - sl_distance,
+                "tp1": tp1_sr,
+                "tp2": current_price + tp2_distance,
+                "tp3": current_price + tp3_distance,
+                "atr": atr_val,
+                "rsi": rsi_val,
+                "trend": trend,
+                "confidence": confidence,
+                "modules_used": integrated['modules_used'],
+                "entry_type": entry_type,
+                "entry_reason": entry_reason,
+                "confirmation_count": confirmation_count,
+                "ml_confidence": ml_confidence,
+                "zone_resolution": zone_resolution_state.value if zone_resolution_state else "NONE",
+                "zone_resolution_reason": zone_resolution_reason or "",
+                "zone_context_type": zone_context_type or "",
+                "signalDecision": {
+                    "zone_resolution": zone_resolution_telemetry,
+                },
+                "quant_bias": integrated.get('quant_bias', 0),  # v8.9.2: For counter-trend
+                "confluence_score": confluence_score,  # v8.9.19: Multi-indicator confluence
+                "atr_ratio": atr_ratio,  # v8.9.23: For RR Engine (with rebound improvement applied)
+                "is_countertrend": trend in ["BEAR", "STRONG_BEAR"],  # v8.9.23
+                "rebound_boost": rebound_score_boost,  # v8.9.24: Entry refiner score boost
+                "rebound_rr_mult": rebound_rr_improvement,  # v8.9.24: R:R improvement
+                "strategy_name": strategy_name,  # Strategy identification
+                "size_multiplier": size_multiplier,  # Strategy health size multiplier
+                "holding_time": holding_time,
+                "support_bounce": support_bounce,
+                "support_distance_pct": support_distance_pct,
+                "has_bullish_reversal": has_bullish_reversal,
+                "time": datetime.now(timezone.utc),
+            }
+        else:
+            holding_time = estimate_holding_time(
+                signal_regime,
+                atr_pct,
+                (current_price - tp1_sr) / current_price * 100 if current_price else 0,
+            )
+            # SHORT signals - no rebound, but still need tags
+            signal_tags = []
+            if trend in ["STRONG_BEAR", "BEAR"]:
+                signal_tags.append("TREND")
+
+            signal = {
                     "symbol": symbol,
                     "direction": "SHORT",
                     "score": final_score,
                     "base_score": base_score,
                     "signals": all_signals,
+                    "tags": signal_tags,  # Strategy tags for trade statistics
                     "price": current_price,
                     "sl": current_price + sl_distance,
                     "tp1": tp1_sr,
@@ -5233,12 +8164,21 @@ def generate_entry_signal(symbol, df, trend, df_htf=None, macro_data=None, df_1h
                     "entry_reason": entry_reason,
                     "confirmation_count": confirmation_count,
                     "ml_confidence": ml_confidence,
+                    "zone_resolution": zone_resolution_state.value if zone_resolution_state else "NONE",
+                    "zone_resolution_reason": zone_resolution_reason or "",
+                    "zone_context_type": zone_context_type or "",
+                    "signalDecision": {
+                        "zone_resolution": zone_resolution_telemetry,
+                    },
                     "quant_bias": integrated.get('quant_bias', 0),  # v8.9.2: For counter-trend
                     "confluence_score": confluence_score,  # v8.9.19: Multi-indicator confluence
                     "atr_ratio": atr_ratio,  # v8.9.23: For RR Engine
                     "is_countertrend": False,  # SHORT is with-trend in BEAR
                     "rebound_boost": 0,  # v8.9.24: No boost for SHORT
                     "rebound_rr_mult": 1.0,  # v8.9.24: No improvement
+                    "strategy_name": strategy_name,  # Strategy identification
+                    "size_multiplier": size_multiplier,  # Apply decision size multiplier
+                    "holding_time": holding_time,
                     "time": datetime.now(timezone.utc)
                 }
     
@@ -5301,8 +8241,12 @@ def determine_entry_type(rsi_val: float, trend: str, atr_pct: float, signals: li
     if any(sig in signals for sig in range_signals):
         market_score -= 1
     
-    # Sprendimas: >= 3 = MARKET, kitu atveju LIMIT
-    if market_score >= 3:
+    # Sprendimas: dinamika pagal rinkos sąlygas
+    market_threshold = 3
+    if atr_pct >= 1.6 or trend in ["STRONG_BULL", "STRONG_BEAR"] or any(sig in signals for sig in breakout_signals):
+        market_threshold = 2  # Greitesnis įėjimas kai rinka juda
+    
+    if market_score >= market_threshold:
         entry_type = "MARKET"
         reason = f"⚡ {', '.join(reasons[:2])}"
     else:
@@ -5340,6 +8284,33 @@ def calculate_hold_time(signal: dict) -> dict:
         'PF_XRPUSD': 1.4,    # XRP - 40% greičiau
     }
     speed = speed_factors.get(symbol, 1.0)
+
+    holding_time = signal.get("holding_time")
+    if isinstance(holding_time, dict) and holding_time.get("TP1") and holding_time.get("TP2"):
+        hours_to_tp1 = max(1.0, float(holding_time.get("TP1", 1)))
+        hours_to_tp2 = max(2.0, float(holding_time.get("TP2", 2)))
+        hours_to_tp3 = max(hours_to_tp2, float(holding_time.get("MAX", hours_to_tp2)))
+        max_hold_hours = max(hours_to_tp2, float(holding_time.get("MAX", hours_to_tp2)))
+
+        tp1_deadline_utc = current_time + timedelta(hours=hours_to_tp1)
+        tp2_deadline_utc = current_time + timedelta(hours=hours_to_tp2)
+        max_hold_deadline_utc = current_time + timedelta(hours=max_hold_hours)
+
+        tp1_deadline = tp1_deadline_utc.astimezone(ireland_tz)
+        tp2_deadline = tp2_deadline_utc.astimezone(ireland_tz)
+        max_hold_deadline = max_hold_deadline_utc.astimezone(ireland_tz)
+
+        return {
+            'hours_to_tp1': round(hours_to_tp1, 1),
+            'hours_to_tp2': round(hours_to_tp2, 1),
+            'hours_to_tp3': round(hours_to_tp3, 1),
+            'max_hold_hours': round(max_hold_hours, 1),
+            'tp1_deadline': tp1_deadline,
+            'tp2_deadline': tp2_deadline,
+            'max_hold_deadline': max_hold_deadline,
+            'timezone': 'Airijos laikas',
+            'recommendation': f"Laikyti iki {max_hold_deadline.strftime('%H:%M')} (max {int(max_hold_hours)}h)"
+        }
     
     # Apskaičiuoti TP atstumus procentais
     if direction == "LONG":
@@ -5416,50 +8387,57 @@ async def send_telegram_signal(signal):
         entry_reason = signal.get('entry_reason', '')
         entry_emoji = "⚡" if entry_type == "MARKET" else "🎯"
         
-        message = f"""
-{direction_emoji} <b>PRO FUTURES SIGNAL</b> {direction_emoji}
-
-<b>Asset:</b> {asset_name} (Perpetual)
-<b>Direction:</b> {signal['direction']}
-<b>Leverage:</b> {LEVERAGE}x
-
-📊 <b>SCORE:</b> {signal['score']}/100 {confidence_stars}
-<i>Base: {base_score} + AI/Quant: {signal['score'] - base_score}</i>
-<i>Moduliai: {modules_used} | Confidence: {confidence*100:.0f}%</i>
-
-💰 <b>ENTRY LEVELS:</b>
-{entry_emoji} <b>Entry {entry_type}:</b> ${signal['price']:.2f}
-<i>{entry_reason}</i>
-<b>Stop Loss:</b> ${signal['sl']:.2f} ({abs((signal['sl']-signal['price'])/signal['price']*100):.1f}%)
-<b>TP1:</b> ${signal['tp1']:.2f} ({abs((signal['tp1']-signal['price'])/signal['price']*100):.1f}%)
-<b>TP2:</b> ${signal['tp2']:.2f}
-<b>TP3:</b> ${signal['tp3']:.2f}
-
-⏱️ <b>LAIKYMO LAIKAS (Airijos):</b>
-<b>TP1:</b> ~{hold_time['hours_to_tp1']}h (iki {hold_time['tp1_deadline'].strftime('%H:%M')})
-<b>TP2:</b> ~{hold_time['hours_to_tp2']}h (iki {hold_time['tp2_deadline'].strftime('%H:%M')})
-<b>MAX:</b> {int(hold_time['max_hold_hours'])}h (iki {hold_time['max_hold_deadline'].strftime('%H:%M')})
-
-📈 <b>TECHNICAL:</b>
-Trend: {signal['trend']} | RSI: {signal['rsi']:.1f}
-{', '.join(ta_signals[:4]) if ta_signals else 'N/A'}
-
-🎯 <b>PRO STRATEGIES:</b>
-{', '.join(pro_signals[:3]) if pro_signals else 'Standard TA'}
-
-🤖 <b>AI + QUANT:</b>
-{', '.join(ai_signals[:3]) if ai_signals else 'No additional signals'}
-
-⏰ {signal['time'].strftime('%Y-%m-%d %H:%M UTC')}
-"""
+        leverage_display = signal.get('leverage', LEVERAGE)
+        position_size_usd = signal.get('position_size_usd')
+        margin_usd = signal.get('margin_usd')
+        size_block = ""
+        if position_size_usd:
+            size_block = f"<b>Position:</b> ${position_size_usd:.2f}\n"
+            if margin_usd:
+                size_block += f"<b>Margin:</b> ${margin_usd:.2f} | <b>Lev:</b> {leverage_display}x\n"
         
-        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+        current_target = auto_adjust_targets.current_target if AUTO_ADJUST_TARGETS_ENABLED else DAILY_PROFIT_TARGET_EUR
+        trade_mode = signal.get("mode", TRADE_MODE)
+        mode_label = "CASHFLOW" if trade_mode == "CASHFLOW" else "SWING"
+        zone_label = signal.get("zone_context_type") or ""
+        trend_label = signal.get("trend") or ""
+        rejection_hint = "Rejection" if any("REJECTION" in s for s in signal.get("signals", [])) else ""
+        context_parts = [p for p in [zone_label, rejection_hint, f"HTF {trend_label}" if trend_label else ""] if p]
+        context_line = " + ".join(context_parts) if context_parts else "Context: N/A"
+        if context_parts:
+            context_line = f"Context: {context_line}"
+
+        message = (
+            f"{'🟢' if mode_label == 'CASHFLOW' else '🔵'} {mode_label} | {asset_name} (Perp) | {signal['direction']}\n"
+            f"Score: {signal['score']}/100 | Conf: {confidence*100:.0f}%\n\n"
+            f"Entry: {signal['price']:.2f}\n"
+            f"SL: {signal['sl']:.2f}\n"
+            f"TP1: {signal['tp1']:.2f}  TP2: {signal['tp2']:.2f}  TP3: {signal['tp3']:.2f}\n\n"
+            f"{context_line}"
+        )
+        
+        sent = await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+        telegram_stats["last_send"] = datetime.now(timezone.utc).isoformat()
+        telegram_stats["last_method"] = "signal"
+        telegram_stats["last_message_id"] = getattr(sent, "message_id", None)
+        telegram_stats["last_error"] = None
+        telegram_stats["last_error_type"] = None
+        telegram_stats["last_chat_id_masked"] = mask_chat_id(CHAT_ID)
+        record_signal_sent()
         print(f"Signal sent: {asset_name} {signal['direction']}")
     except Exception as e:
         print(f"Telegram error: {e}")
+        telegram_stats["last_send"] = datetime.now(timezone.utc).isoformat()
+        telegram_stats["last_method"] = "signal"
+        telegram_stats["last_message_id"] = None
+        telegram_stats["last_error"] = str(e)
+        telegram_stats["last_error_type"] = type(e).__name__
+        telegram_stats["last_chat_id_masked"] = mask_chat_id(CHAT_ID)
 
 async def send_telegram_auto_trade(signal, trade_result, action="OPEN"):
     """Send Telegram notification for auto-executed trades"""
+    if not AUTO_TRADING_ENABLED:
+        return
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
     
@@ -5522,6 +8500,55 @@ W/L: {auto_trading_state['daily_wins']}/{auto_trading_state['daily_losses']}
         print(f"  📱 Auto-trade notification sent: {asset_name} {action}")
     except Exception as e:
         print(f"  ⚠️ Telegram auto-trade error: {e}")
+
+async def send_telegram_status(message: str):
+    """Send non-critical status message to Telegram."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    try:
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+    except Exception as e:
+        print(f"  ⚠️ Telegram status error: {e}")
+
+async def send_test_signal(
+    symbol="PF_XBTUSD",
+    direction="LONG",
+    price=42000.0,
+    sl=41400.0,
+    tp1=43000.0,
+    tp2=44000.0,
+    tp3=45500.0,
+    position_size_usd=250.0,
+    margin_usd=50.0,
+    leverage=5
+):
+    """Send a test signal to Telegram."""
+    signal = {
+        "symbol": symbol,
+        "direction": direction,
+        "score": 88,
+        "base_score": 82,
+        "signals": ["TEST_SIGNAL", "STRUCTURE_BULL", "EMA_STACK", "VWAP_SUPPORT"],
+        "price": price,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "atr": 250.0,
+        "rsi": 48.0,
+        "trend": "BULL",
+        "confidence": 0.78,
+        "modules_used": 6,
+        "entry_type": "LIMIT",
+        "entry_reason": "🧪 TEST SIGNAL",
+        "confirmation_count": 4,
+        "time": datetime.now(timezone.utc),
+        "position_size_usd": position_size_usd,
+        "margin_usd": margin_usd,
+        "leverage": leverage,
+    }
+    await send_telegram_signal(signal)
 
 async def send_position_update(position, update_type, current_price, extra_info=None, extra_data=None):
     """Send Telegram notification for position updates (trailing, breakeven, TP/SL hits)"""
@@ -5896,11 +8923,16 @@ async def manage_open_positions():
 # MAIN SIGNAL LOOP
 # ================================
 async def check_signals():
-    global last_signals, signals_history, bot_stats
+    global last_signals, signals_history, bot_stats, bear_last_update, htf_last_update, htf_last_candle_time, htf_state
     
     print(f"\n{'='*50}")
     print(f"Checking signals at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     print(f"{'='*50}")
+
+    allowed, reason = sunday_engine.is_sunday_trading_time()
+    if not allowed:
+        print(f"  ⏸️ {reason}")
+        return
     
     # v8.9.13: Amateur Hour warning
     try:
@@ -5914,12 +8946,74 @@ async def check_signals():
     # Fetch open positions from Kraken
     if POSITION_TRACKING_ENABLED:
         await fetch_kraken_positions()
+
+    # Bear market update (periodic)
+    if bear_engine:
+        now = datetime.now(timezone.utc)
+        needs_update = (
+            bear_last_update is None
+            or (now - bear_last_update).total_seconds() > BEAR_MARKET_UPDATE_INTERVAL
+        )
+        if needs_update:
+            try:
+                btc_change_7d = await get_btc_7d_change()
+                fear_greed = sentiment_analyzer.get_fear_greed_index().get("value", 50)
+                market_data = {
+                    'btc_change_7d': btc_change_7d,
+                    'total_cap_change': btc_change_7d,  # Fallback proxy
+                    'fear_greed': fear_greed,
+                    'dominant_trend': market_regime_state.get("regime", "NEUTRAL")
+                }
+                bear_engine.update_market_data(market_data)
+                bear_last_update = now
+            except Exception as e:
+                print(f"  ⚠️ Bear market update error: {e}")
+
+    # HTF structure update (new 1H candle)
+    try:
+        now = datetime.now(timezone.utc)
+        if htf_last_update is None or (now - htf_last_update).total_seconds() >= 300:
+            htf_df = await fetch_ohlcv("PF_XBTUSD", TIMEFRAME_TREND, 120)
+            if htf_df is not None and len(htf_df) >= 10:
+                candle_time = None
+                if "timestamp" in htf_df.columns:
+                    candle_time = htf_df["timestamp"].iloc[-1]
+                else:
+                    candle_time = int(now.timestamp())
+                if htf_last_candle_time != candle_time:
+                    atr_val = calc_atr(htf_df).iloc[-1]
+                    candles = htf_df[["open", "high", "low", "close"]].to_dict("records")
+                    htf_state = update_htf_structure(candles, atr_val, direction_lock)
+                    htf_last_candle_time = candle_time
+                    htf_last_update = now
+                    hold_long = structure_hold(candles, "LONG")
+                    hold_short = structure_hold(candles, "SHORT")
+                    print(
+                        f"🔒 HTF LOCK: {htf_state.get('lock')} | BOS: {htf_state.get('bos')} | "
+                        f"HOLD(L/S): {hold_long}/{hold_short}"
+                    )
+    except Exception as e:
+        print(f"  ⚠️ HTF structure update error: {e}")
     
     # v8.9.19: Collect all valid signals first, then sort by score before auto-trading
     collected_signals = []  # List of (symbol, signal, asset_name) tuples
     
+    def normalize_asset_name(sym: str) -> str:
+        return ASSET_NAMES.get(sym, sym).replace("PF_", "").replace("USD", "")
+
+    allowed_assets = [normalize_asset_name(s) for s in FUTURES_ASSETS]
     for symbol in FUTURES_ASSETS:
         try:
+            asset_name = normalize_asset_name(symbol)
+            if asset_name not in allowed_assets:
+                continue
+
+            in_supply_zone = False
+            in_demand_zone = False
+            htf_supply_breakout = False
+            htf_demand_breakdown = False
+            location_decision = None
+
             # 4H Macro analysis (big picture)
             df_4h = await fetch_ohlcv(symbol, TIMEFRAME_MACRO, 100)
             macro = analyze_macro(df_4h)
@@ -5930,14 +9024,216 @@ async def check_signals():
             
             # 15m Entry signals
             df_15m = await fetch_ohlcv(symbol, TIMEFRAME_ENTRY, 100)
+
+            # LOCATION ENGINE (HTF BOS / LOCK -> zones -> allow/deny)
+            try:
+                atr_4h = calc_atr(df_4h).iloc[-1] if df_4h is not None else None
+                htf_candles = df_4h[["open", "high", "low", "close"]].to_dict("records") if df_4h is not None else []
+                ll_printed = lower_low_printed(htf_candles) if htf_candles else False
+                bearish_impulse_flag = bearish_impulse(df_4h)
+                htf_blocks = OrderBlocks.detect_htf_order_blocks(df_4h, atr_4h, impulse_mult=ZONE_IMPULSE_MULT)
+                current_price = df_1h["close"].iloc[-1] if df_1h is not None else 0
+                supply_zone = None
+                demand_zone = None
+                for ob in htf_blocks:
+                    zone_type = OrderBlocks.classify_zone(ob)
+                    if ob.contains_price(current_price):
+                        if zone_type == "SUPPLY":
+                            in_supply_zone = True
+                            supply_zone = ob
+                            supply_zone.atr = atr_4h
+                        if zone_type == "DEMAND":
+                            in_demand_zone = True
+                            demand_zone = ob
+                            demand_zone.atr = atr_4h
+                last_htf_close = df_4h["close"].iloc[-1] if df_4h is not None else current_price
+                htf_supply_breakout = False
+                htf_demand_breakdown = False
+                near_supply_zone = False
+                near_demand_zone = False
+                resistance_break = False
+                zone_accepted = False
+                next_candle_bullish = False
+                if supply_zone and atr_4h is not None:
+                    htf_supply_breakout = last_htf_close > supply_zone.top + (ZONE_BUFFER_ATR * atr_4h)
+                    supply_buffer = 0.25 * atr_4h
+                    if (supply_zone.bottom - supply_buffer) <= current_price <= (supply_zone.top + supply_buffer):
+                        near_supply_zone = True
+                if demand_zone and atr_4h is not None:
+                    htf_demand_breakdown = last_htf_close < demand_zone.bottom - (ZONE_BUFFER_ATR * atr_4h)
+                    demand_buffer = 0.25 * atr_4h
+                    if (demand_zone.bottom - demand_buffer) <= current_price <= (demand_zone.top + demand_buffer):
+                        near_demand_zone = True
+
+                supply_rejection_guard = False
+                if supply_zone and df_15m is not None and len(df_15m) >= 2:
+                    zone_high = supply_zone.top
+                    breakout_candle = df_15m.iloc[-2]
+                    confirm_candle = df_15m.iloc[-1]
+                    resistance_break = breakout_candle["high"] > zone_high
+                    breakout_range = breakout_candle["high"] - breakout_candle["low"]
+                    breakout_body = abs(breakout_candle["close"] - breakout_candle["open"])
+                    breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+                    zone_accepted = (breakout_candle["close"] > zone_high) and (breakout_body_pct >= 0.6)
+                    next_candle_bullish = confirm_candle["close"] >= confirm_candle["open"]
+                    confirm_range = confirm_candle["high"] - confirm_candle["low"]
+                    confirm_body = abs(confirm_candle["close"] - confirm_candle["open"])
+                    confirm_body_pct = confirm_body / confirm_range if confirm_range > 0 else 0
+                    touched_supply = breakout_candle["high"] >= zone_high
+                    closed_below_supply = breakout_candle["close"] < zone_high
+                    next_candle_weak = (confirm_candle["close"] < confirm_candle["open"]) or (confirm_body_pct < 0.3)
+                    supply_rejection_guard = touched_supply and closed_below_supply and next_candle_weak
+
+                location_engine = LocationEngine()
+                location_decision = location_engine.evaluate(type("LC", (), {
+                    "htf_bos": htf_state.get("bos"),
+                    "in_supply_zone": in_supply_zone,
+                    "in_demand_zone": in_demand_zone,
+                    "htf_supply_breakout": htf_supply_breakout,
+                    "htf_demand_breakdown": htf_demand_breakdown,
+                    "near_supply_zone": near_supply_zone,
+                    "near_demand_zone": near_demand_zone,
+                    "bearish_impulse": bearish_impulse_flag,
+                    "resistance_break": resistance_break,
+                    "zone_accepted": zone_accepted,
+                    "next_candle_bullish": next_candle_bullish,
+                    "supply_rejection_guard": supply_rejection_guard,
+                })())
+                if not location_decision.allow_long and not location_decision.allow_short:
+                    print(f"  → 🚫 LOCATION BLOCK: {location_decision.reason}")
+                    record_block("LOCATION_ENGINE")
+                    continue
+            except Exception as e:
+                print(f"  ⚠️ Location engine error: {e}")
+
+            # Zone interaction (computed after signal direction is known)
+            zone_interaction = ZoneInteraction.NONE
+            zone_context_type = None
+
+            regime_flip_state = "NORMAL"
+            if df_1h is not None and len(df_1h) >= 10:
+                last_n = df_1h.iloc[-10:]
+                green_ratio = (last_n["close"] >= last_n["open"]).mean()
+                red_ratio = 1.0 - green_ratio
+                if trend in ["BEAR", "STRONG_BEAR"] and green_ratio >= 0.7:
+                    regime_flip_state = "POTENTIAL_FLIP"
+                if trend in ["BULL", "STRONG_BULL"] and red_ratio >= 0.7:
+                    regime_flip_state = "POTENTIAL_FLIP"
+
+            expansion_bias_state = "NORMAL"
+            range_atr = 0.0
+            atr_1h = calc_atr(df_1h).iloc[-1] if df_1h is not None and len(df_1h) >= 14 else None
+            if df_1h is not None and atr_1h:
+                if len(df_1h) >= 20:
+                    range_atr = (df_1h["high"].iloc[-20:].max() - df_1h["low"].iloc[-20:].min()) / atr_1h
+                rsi_1h = calc_rsi(df_1h["close"]).iloc[-1]
+                if range_atr >= 3.0 and rsi_1h > 75:
+                    expansion_bias_state = "OVEREXTENDED_UP"
+                if range_atr >= 3.0 and rsi_1h < 25:
+                    expansion_bias_state = "OVEREXTENDED_DOWN"
             
             # v8.9.3: Get quant bias for this asset
             asset_quant_bias = 0
-            asset_name = symbol.replace('PF_', '').replace('USD', '')
-            if asset_name in quant_results and quant_results[asset_name]:
-                asset_quant_bias, _ = quant_engine.get_quant_signal_bias(quant_results[asset_name])
+            if QUANT_ENABLED and quant_engine is not None:
+                if asset_name in quant_results and quant_results[asset_name]:
+                    asset_quant_bias, _ = quant_engine.get_quant_signal_bias(quant_results[asset_name])
             
-            signal = generate_entry_signal(symbol, df_15m, trend, df_htf=df_1h, macro_data=macro, df_1h=df_1h, quant_bias=asset_quant_bias)
+            df_daily = await fetch_ohlcv(symbol, TIMEFRAME_DAILY, 30)
+            df_weekly = await fetch_ohlcv(symbol, TIMEFRAME_WEEKLY, 10)
+            signal = generate_entry_signal(
+                symbol,
+                df_15m,
+                trend,
+                df_htf=df_1h,
+                macro_data=macro,
+                df_1h=df_1h,
+                df_daily=df_daily,
+                df_weekly=df_weekly,
+                quant_bias=asset_quant_bias,
+                demand_zone=demand_zone,
+                supply_zone=supply_zone,
+                in_demand_zone=in_demand_zone,
+                in_supply_zone=in_supply_zone,
+                near_demand_zone=near_demand_zone,
+                near_supply_zone=near_supply_zone,
+            )
+            if signal is None:
+                continue
+
+            # ================================
+            # Candle Close Confirmation Engine
+            # ================================
+            direction = signal.get("direction")
+            zone_for_signal = None
+            if direction == "LONG" and demand_zone and (in_demand_zone or near_demand_zone):
+                zone_for_signal = demand_zone
+                zone_context_type = "DEMAND"
+            elif direction == "SHORT" and supply_zone and (in_supply_zone or near_supply_zone):
+                zone_for_signal = supply_zone
+                zone_context_type = "SUPPLY"
+
+            zone_resolution_state = signal.get("zone_resolution", "NONE")
+            zone_resolution_reason = signal.get("zone_resolution_reason", "")
+
+            if zone_for_signal is not None and df_15m is not None and len(df_15m) >= 2:
+                last_closed = df_15m.iloc[-2]
+
+                # Manipulation Candle Detector (wick-dominant)
+                atr_15m = calc_atr(df_15m).iloc[-1] if len(df_15m) >= 14 else None
+                if atr_15m:
+                    candle_range = max(1e-9, last_closed["high"] - last_closed["low"])
+                    candle_body = abs(last_closed["close"] - last_closed["open"])
+                    wick_ratio = (candle_range - candle_body) / candle_range
+                    body_atr = candle_body / atr_15m
+                    if wick_ratio > 0.6 and body_atr < 0.8:
+                        asset_name = ASSET_NAMES.get(symbol, symbol)
+                        print(f"  → 🚫 {asset_name}: Manipulation candle (wick-dominant)")
+                        record_block("MANIPULATION_CANDLE")
+                        continue
+
+            if zone_resolution_state == "CONFIRMED_REJECTION":
+                zone_interaction = ZoneInteraction.TOUCH
+            if zone_resolution_state == "CONFIRMED_BREAK":
+                zone_interaction = ZoneInteraction.CONFIRMED
+
+            signal["zone_interaction"] = zone_interaction.value
+            signal["zone_resolution"] = zone_resolution_state
+            signal["zone_resolution_reason"] = zone_resolution_reason
+            signal["regime_flip"] = regime_flip_state
+            signal["expansion_bias"] = expansion_bias_state
+
+            avg_atr_per_hour = 4.0
+            if atr_1h is not None and signal.get("atr"):
+                avg_atr_per_hour = atr_1h / signal["atr"] if signal["atr"] else 4.0
+            distance_to_target_atr = 0.0
+            if signal.get("atr"):
+                distance_to_target_atr = abs(signal["tp1"] - signal["price"]) / signal["atr"]
+            holding_time = estimate_hold_time(
+                HoldTimeContext(
+                    distance_to_target_atr=distance_to_target_atr,
+                    avg_atr_per_hour=avg_atr_per_hour,
+                    zone_interaction=zone_interaction,
+                    regime_flip=regime_flip_state,
+                )
+            )
+            regime_hold = signal.get("holding_time")
+            if isinstance(regime_hold, dict):
+                holding_time = {
+                    "TP1": round(regime_hold.get("TP1", holding_time["TP1"]) * 0.6 + holding_time["TP1"] * 0.4, 1),
+                    "TP2": round(regime_hold.get("TP2", holding_time["TP2"]) * 0.6 + holding_time["TP2"] * 0.4, 1),
+                    "MAX": round(regime_hold.get("MAX", holding_time["MAX"]) * 0.6 + holding_time["MAX"] * 0.4, 1),
+                }
+            signal["holding_time"] = holding_time
+
+            if not location_decision.allow_long and signal.get("direction") == "LONG":
+                print("  → 🚫 LOCATION BLOCK: LONG disabled by HTF/zones")
+                record_block("LOCATION_ENGINE")
+                continue
+            if not location_decision.allow_short and signal.get("direction") == "SHORT":
+                print("  → 🚫 LOCATION BLOCK: SHORT disabled by HTF/zones")
+                record_block("LOCATION_ENGINE")
+                continue
+
             
             # ================================
             # v8.9.24: 5m ENTRY OPTIMIZER (FUND MODE)
@@ -5945,7 +9241,6 @@ async def check_signals():
             # 5m NO LONGER generates signals - only optimizes entry for valid 15m signals
             # Fetched later when signal is confirmed, before auto-trading
             df_5m = None  # Will be fetched only if needed for entry optimization
-            df_daily = await fetch_ohlcv(symbol, TIMEFRAME_DAILY, 30)
             # ================================
             
             # ================================
@@ -6002,6 +9297,7 @@ async def check_signals():
                                 "modules_used": 1,
                                 "entry_type": "MARKET",
                                 "entry_reason": "📦 Box Breakout UP",
+                                "strategy_name": "BREAKOUT",  # Box breakout is a breakout strategy
                                 "time": datetime.now(timezone.utc)
                             }
                         else:  # SHORT
@@ -6026,6 +9322,7 @@ async def check_signals():
                                 "modules_used": 1,
                                 "entry_type": "MARKET",
                                 "entry_reason": "📦 Box Breakout DOWN",
+                                "strategy_name": "BREAKOUT",  # Box breakout is a breakout strategy
                                 "time": datetime.now(timezone.utc)
                             }
             
@@ -6034,6 +9331,9 @@ async def check_signals():
                 print(f"  📦 BOX BREAKOUT detected: {box_signal['direction']}")
                 signal = box_signal
             # ================================
+
+            if signal:
+                signal['score'] += TradingHoursOptimizer.trading_hours_penalty(asset_name)
             
             asset_name = ASSET_NAMES.get(symbol, symbol)
             current_price = df_15m['close'].iloc[-1] if df_15m is not None else 0
@@ -6217,17 +9517,396 @@ async def check_signals():
             print(f"{asset_name}: ${current_price:.2f} | Trend: {trend} | Score: {trend_score}{macro_info}{squeeze_info}{structure_info}{vwap_info}{sr_flip_info}{breaker_info}{elliott_info}{fib718_info}{exhaust_info}{candle_strength_info}{mfi_info}{cmf_info}{mf_div_info}{wave_info}{stop_hunt_info}{rsi_info}")
             
             if signal:
+                if XGBOOST_AVAILABLE and xgb_engine and XGBoostConfig:
+                    try:
+                        market_data = build_xgb_market_data(df_15m, df_1h, df_4h, signal, current_price)
+                        signal = await xgb_engine.enhance_signal(signal, market_data)
+                        if "final_score" in signal:
+                            signal["score"] = signal["final_score"]
+                        if "ml_adjusted_confidence" in signal:
+                            signal["confidence"] = signal["ml_adjusted_confidence"]
+                        if not XGBoostConfig.SHADOW_MODE and not signal.get("ml_trade_recommendation", True):
+                            print(f"  🤖 ML filtered: {symbol} ({signal.get('ml_confidence', 0):.2f})")
+                            continue
+                    except Exception as e:
+                        print(f"  ⚠️ XGBoost enhance error: {e}")
+
                 # Check if position already open on Kraken
                 if POSITION_TRACKING_ENABLED and has_open_position(symbol, signal['direction']):
                     print(f"  → Skipped: {signal['direction']} position already open on Kraken")
                     continue
+
+                # Position correlation check (same-direction exposure)
+                is_correlated, corr_reason = await check_position_correlation(symbol, signal['direction'], df_reference=df_1h)
+                if is_correlated:
+                    print(f"  → Correlation blocked: {corr_reason}")
+                    continue
                 
+                # Bear market filters
+                if bear_engine:
+                    try:
+                        bear_candle_body_pct = 0.0
+                        bear_atr_pct = 0.0
+                        bear_ema_distance = 0.0
+                        if df_15m is not None and len(df_15m) >= 14:
+                            last_candle = df_15m.iloc[-1]
+                            current_price = last_candle['close']
+                            candle_body = abs(last_candle['close'] - last_candle['open'])
+                            bear_candle_body_pct = (candle_body / current_price * 100) if current_price > 0 else 0
+                            atr = calc_atr(df_15m).iloc[-1]
+                            bear_atr_pct = (atr / current_price * 100) if current_price > 0 else 0
+                            ema9 = calc_ema(df_15m['close'], 9).iloc[-1]
+                            bear_ema_distance = (abs(current_price - ema9) / current_price * 100) if current_price > 0 else 0
+                        
+                        bear_result = bear_engine.process_signal_filters({
+                            'asset': asset_name,
+                            'direction': signal.get('direction', 'LONG'),
+                            'rsi': signal.get('rsi', 50),
+                            'candle_body_pct': bear_candle_body_pct,
+                            'atr_pct': bear_atr_pct,
+                            'ema_distance': bear_ema_distance
+                        })
+                        
+                        if not bear_result.get('bear_market_allowed', True):
+                            print(f"  → Bear market blocked: {asset_name} ({bear_result.get('bear_adjustments', {}).get('ema', {}).get('reason', 'FILTER_BLOCK')})")
+                            continue
+                        
+                        if bear_engine.detector.is_bear_market:
+                            bear_multiplier = bear_engine.config.RELAXED_PARAMS['position_size_multiplier']
+                            if bear_multiplier != 1.0:
+                                signal['size_multiplier'] = signal.get('size_multiplier', 1.0) * bear_multiplier
+                    except Exception as e:
+                        print(f"  ⚠️ Bear market filter error: {e}")
+
                 # Check all filters before sending signal
                 is_blocked, block_reasons = check_all_filters(signal['direction'], signal)
                 
                 if is_blocked:
                     print(f"  → Signal BLOCKED: {', '.join(block_reasons)}")
                     continue
+                
+                # Entry Timing Filter (FUND MODE) - WAIT → ARM → ENTER
+                if df_15m is not None and len(df_15m) >= 14:
+                    try:
+                        # Calculate required variables for entry timing filter
+                        current_rsi = calc_rsi(df_15m['close']).iloc[-1]
+                        
+                        # Last candle body percentage
+                        last_candle = df_15m.iloc[-1]
+                        candle_body = abs(last_candle['close'] - last_candle['open'])
+                        current_price = last_candle['close']
+                        last_candle_body_pct = (candle_body / current_price * 100) if current_price > 0 else 0
+                        
+                        # Distance from EMA
+                        ema9 = calc_ema(df_15m['close'], 9).iloc[-1]
+                        distance_from_ema = abs(current_price - ema9)
+                        distance_from_ema_pct = (distance_from_ema / current_price * 100) if current_price > 0 else 0
+                        
+                        # ATR percentage
+                        atr = calc_atr(df_15m).iloc[-1]
+                        current_atr_pct = (atr / current_price * 100) if current_price > 0 else 0
+                        
+                        # Impulse candle detection
+                        candle_range = last_candle['high'] - last_candle['low']
+                        is_impulse_candle = (candle_body > candle_range * 0.6) if candle_range > 0 else False
+                        
+                        # Get previous state for this symbol
+                        previous_state = entry_timing_states.get(symbol, {})
+                        previous_distance_pct = previous_state.get('distance_pct', None)
+                        
+                        # Create timing context and check
+                        # FUND TAISYKLĖ: Score NIEKADA negali apeiti entry timing
+                        timing_ctx = EntryTimingContext(
+                            rsi=current_rsi,
+                            candle_body_pct=last_candle_body_pct,
+                            distance_from_ema_pct=distance_from_ema_pct,
+                            atr_pct=current_atr_pct,
+                            impulse_candle=is_impulse_candle,
+                            previous_distance_pct=previous_distance_pct,
+                            relax_level=get_effective_relax_level("ENTRY_TIMING")
+                        )
+                        
+                        timing_result = entry_timing_filter(timing_ctx)
+                        
+                        # Update state tracking
+                        entry_timing_states[symbol] = {
+                            'state': timing_result.state,
+                            'distance_pct': distance_from_ema_pct,
+                            'last_check': datetime.now(timezone.utc)
+                        }
+                        
+                        # State emoji mapping
+                        state_emoji = {
+                            'WAIT': '⏳',
+                            'ARM': '🎯',
+                            'ENTER': '✅'
+                        }
+                        emoji = state_emoji.get(timing_result.state, '❓')
+                        
+                        if not timing_result.allowed:
+                            override_used = False
+                            if (
+                                EMA_DISTANCE_OVERRIDE_ENABLED
+                                and signal.get("direction") == "SHORT"
+                                and trend in ("STRONG_BEAR", "BEAR")
+                                and signal.get("score", 0) >= EMA_DISTANCE_OVERRIDE_MIN_SCORE
+                                and "EMA" in timing_result.reason
+                            ):
+                                ema_dist = distance_from_ema_pct
+                                if ema_dist <= 0.3:
+                                    size_mult = 1.0
+                                    override_used = True
+                                elif ema_dist <= 0.8:
+                                    size_mult = 0.7
+                                    override_used = True
+                                elif ema_dist <= 1.2:
+                                    size_mult = 0.4
+                                    override_used = True
+                                elif ema_dist <= 1.6:
+                                    size_mult = 0.25
+                                    override_used = True
+                                if override_used:
+                                    signal["size_multiplier"] = signal.get("size_multiplier", 1.0) * size_mult
+                                    print(f"  → ⚡ EMA override: allow SHORT (dist={ema_dist:.2f}%, size×{size_mult:.2f})")
+                            if not override_used:
+                                print(f"  → {emoji} {timing_result.state}: {timing_result.state_reason} ({timing_result.reason})")
+                                record_block("ENTRY_TIMING")
+                                continue
+                        else:
+                            print(f"  → {emoji} {timing_result.state}: {timing_result.state_reason} - ENTRY ALLOWED")
+                    except Exception as e:
+                        print(f"  → Entry timing filter error: {e}")
+                        # Continue if filter fails (fail-safe)
+                
+                # Pullback Entry Engine (FUND MODE)
+                if df_15m is not None and len(df_15m) >= 50:
+                    try:
+                        strategy_name = signal.get("strategy_name", "TREND_CONTINUATION")
+                        mode = "TREND" if strategy_name == "TREND_CONTINUATION" else "CASHFLOW"
+
+                        # Calculate required variables for pullback entry engine
+                        pb_current_price = df_15m['close'].iloc[-1]
+                        
+                        # EMA 21 (fast) and EMA 50 (slow)
+                        ema_21 = calc_ema(df_15m['close'], 21).iloc[-1]
+                        ema_50 = calc_ema(df_15m['close'], 50).iloc[-1]
+                        
+                        # VWAP
+                        vwap_series = calc_vwap(df_15m, period=50)
+                        vwap_value = vwap_series.iloc[-1] if vwap_series is not None and len(vwap_series) > 0 else pb_current_price
+                        
+                        # RSI (already calculated above, reuse)
+                        pb_rsi = current_rsi
+                        
+                        # ATR percentage (already calculated above, reuse)
+                        pb_atr_pct = current_atr_pct
+                        
+                        # Candle body percentage (as percentage of range, not price)
+                        pb_last_candle = df_15m.iloc[-1]
+                        pb_candle_body = abs(pb_last_candle['close'] - pb_last_candle['open'])
+                        pb_candle_range = pb_last_candle['high'] - pb_last_candle['low']
+                        pb_candle_body_pct = (pb_candle_body / pb_candle_range * 100) if pb_candle_range > 0 else 0
+
+                        # Previous candle body percentage (for impulse fade)
+                        if len(df_15m) >= 2:
+                            pb_prev_candle = df_15m.iloc[-2]
+                            pb_prev_body = abs(pb_prev_candle['close'] - pb_prev_candle['open'])
+                            pb_prev_range = pb_prev_candle['high'] - pb_prev_candle['low']
+                            pb_prev_candle_body_pct = (pb_prev_body / pb_prev_range * 100) if pb_prev_range > 0 else 0
+                        else:
+                            pb_prev_candle_body_pct = 0
+
+                        # Volume declining check
+                        if 'volume' in df_15m.columns and len(df_15m) >= 2:
+                            pb_cur_vol = df_15m['volume'].iloc[-1]
+                            pb_prev_vol = df_15m['volume'].iloc[-2]
+                            pb_volume_declining = pb_cur_vol < pb_prev_vol
+                        else:
+                            pb_volume_declining = False
+                        
+                        # Trend score (from analyze_trend)
+                        pb_trend_score = trend_score
+
+                        # EMA break check for late impulse fade
+                        pb_ema_mid = (ema_21 + ema_50) / 2
+                        pb_ema_not_broken = not (pb_last_candle['low'] <= pb_ema_mid <= pb_last_candle['high'])
+                        pb_price_above_ema = pb_current_price >= pb_ema_mid
+                        pb_impulse_state = pullback_impulse_states.get(symbol, "NO_IMPULSE")
+                        
+                        # Create pullback context and evaluate
+                        pb_relax = min(2, get_effective_relax_level("PULLBACK_ENGINE"))
+                        pullback_ctx = PullbackContext(
+                            price=pb_current_price,
+                            ema_fast=ema_21,
+                            ema_slow=ema_50,
+                            vwap=vwap_value,
+                            rsi=pb_rsi,
+                            atr_pct=pb_atr_pct,
+                            candle_body_pct=pb_candle_body_pct,
+                            prev_candle_body_pct=pb_prev_candle_body_pct,
+                            volume_declining=pb_volume_declining,
+                            ema_not_broken=pb_ema_not_broken,
+                            trend_score=pb_trend_score,
+                            relax_level=pb_relax,
+                            impulse_state=pb_impulse_state,
+                            price_above_ema=pb_price_above_ema
+                        )
+                        
+                        pb_decision = evaluate_pullback_entry(pullback_ctx)
+                        pullback_impulse_states[symbol] = pb_decision.impulse_state
+                        pb_relax = min(2, get_effective_relax_level("PULLBACK_ENGINE"))
+                        
+                        # State emoji mapping
+                        pb_state_emoji = {
+                            'WAIT': '⏳',
+                            'ARM': '🎯',
+                            'ENTER': '✅',
+                            'BLOCKED': '🚫'
+                        }
+                        pb_emoji = pb_state_emoji.get(pb_decision.state.value, '❓')
+                        
+                        print(f"  → 🧭 PULLBACK_STATE: {pb_emoji} {pb_decision.state.value} | {pb_decision.reason} (mode={mode}, relax={pb_relax}, impulse={pb_decision.impulse_state})")
+                        
+                        # If entry already allowed, pullback cannot veto (only refine)
+                        if pb_decision.state != EntryState.ENTER:
+                            if pb_decision.state == EntryState.BLOCKED:
+                                size_mult = 0.5
+                                action = "SIZE_REDUCE"
+                            elif pb_decision.state == EntryState.ARM:
+                                size_mult = 0.7
+                                action = "DELAY"
+                            else:
+                                size_mult = 0.7
+                                action = "DELAY"
+                            signal["size_multiplier"] = signal.get("size_multiplier", 1.0) * size_mult
+                            signal["entry_type"] = "LIMIT"
+                            signal.setdefault("signals", []).append(f"PULLBACK_{action}")
+                            print(f"  → 🧭 PULLBACK_ENGINE: {action} (size×{size_mult:.2f})")
+                        
+                        # Confluence Gate (FUND MODE) - Final check
+                        try:
+                            # Get confluence score from signal
+                            conf_score = signal.get('confluence_score', 0)
+                            
+                            # Calculate EMA stack (9, 21, 50)
+                            conf_ema9 = calc_ema(df_15m['close'], 9).iloc[-1]
+                            conf_ema21 = ema_21  # Already calculated above
+                            conf_ema50 = ema_50  # Already calculated above
+                            conf_current_price = pb_current_price
+                            
+                            # EMA stack perfect (for LONG: 9 > 21 > 50)
+                            if signal['direction'] == "LONG":
+                                ema_stack_perfect = conf_ema9 > conf_ema21 > conf_ema50
+                                price_above_emas = (conf_current_price > conf_ema9 and 
+                                                   conf_current_price > conf_ema21 and 
+                                                   conf_current_price > conf_ema50)
+                            else:  # SHORT
+                                ema_stack_perfect = conf_ema9 < conf_ema21 < conf_ema50
+                                price_above_emas = (conf_current_price < conf_ema9 and 
+                                                   conf_current_price < conf_ema21 and 
+                                                   conf_current_price < conf_ema50)
+                            
+                            # MACD bullish/bearish
+                            from ta.trend import MACD as MACD_Indicator
+                            macd_indicator = MACD_Indicator(df_15m['close'])
+                            macd_line = macd_indicator.macd().iloc[-1]
+                            macd_signal = macd_indicator.macd_signal().iloc[-1]
+                            
+                            if signal['direction'] == "LONG":
+                                macd_bullish = macd_line > macd_signal
+                            else:  # SHORT
+                                macd_bullish = macd_line < macd_signal  # For SHORT, bearish MACD is "bullish" for the trade
+                            
+                            # Create confluence context and evaluate
+                            conf_ctx = ConfluenceContext(
+                                score=conf_score,
+                                ema_stack_perfect=ema_stack_perfect,
+                                price_above_emas=price_above_emas,
+                                macd_bullish=macd_bullish,
+                                rsi=pb_rsi,
+                                atr_pct=pb_atr_pct,
+                                pullback_state=pb_decision.state.value,
+                                relax_level=get_effective_relax_level("CONFLUENCE_GATE")
+                            )
+                            
+                            conf_decision = evaluate_confluence_gate(conf_ctx)
+                            
+                            print(f"  → 🧱 CONFLUENCE_GATE: {conf_decision.value}")
+                            
+                            # Confluence behavior by mode
+                            if TRADE_MODE == "CASHFLOW":
+                                if conf_score >= 70:
+                                    conf_size = 1.0
+                                    conf_tag = "CONF_HIGH"
+                                else:
+                                    conf_size = 0.5
+                                    conf_tag = "CONF_LOW"
+                                signal["size_multiplier"] = signal.get("size_multiplier", 1.0) * conf_size
+                                signal.setdefault("signals", []).append(conf_tag)
+                                print(f"  → 🧱 CONFLUENCE: {conf_tag} → size×{conf_size:.2f}")
+                            else:
+                                # SWING: confluence can block
+                                if conf_decision == ConfluenceDecision.BLOCK:
+                                    print(f"  → ❌ FUND MODE: Entry blocked by confluence gate")
+                                    record_block("CONFLUENCE_GATE")
+                                    continue
+                            
+                            # Impulse Exhaustion Filter (FUND MODE) - Final entry protection
+                            try:
+                                # Calculate candle body and range in ATR units
+                                impulse_last_candle = df_15m.iloc[-1]
+                                impulse_candle_body = abs(impulse_last_candle['close'] - impulse_last_candle['open'])
+                                impulse_candle_range = impulse_last_candle['high'] - impulse_last_candle['low']
+                                impulse_atr = atr  # Already calculated above
+                                
+                                candle_body_atr = impulse_candle_body / impulse_atr if impulse_atr > 0 else 0
+                                candle_range_atr = impulse_candle_range / impulse_atr if impulse_atr > 0 else 0
+                                
+                                # Volume spike detection
+                                if 'volume' in df_15m.columns and len(df_15m) >= 20:
+                                    current_volume = df_15m['volume'].iloc[-1]
+                                    avg_volume = df_15m['volume'].rolling(20).mean().iloc[-1]
+                                    volume_spike = current_volume > avg_volume * 1.6 if avg_volume > 0 else False
+                                else:
+                                    volume_spike = False
+                                
+                                # Distance from EMA (already calculated above)
+                                impulse_distance_from_ema_pct = distance_from_ema_pct
+                                
+                                # Create impulse context and evaluate
+                                impulse_ctx = ImpulseContext(
+                                    candle_body_atr=candle_body_atr,
+                                    candle_range_atr=candle_range_atr,
+                                    rsi=pb_rsi,
+                                    distance_from_ema_pct=impulse_distance_from_ema_pct,
+                                    volume_spike=volume_spike,
+                                    pullback_state=pb_decision.state.value,
+                                    relax_level=get_effective_relax_level("IMPULSE_FILTER")
+                                )
+                                
+                                impulse_decision = evaluate_impulse_exhaustion(impulse_ctx)
+                                impulse_relax = get_effective_relax_level("IMPULSE_FILTER")
+                                
+                                print(f"  → 🔥 IMPULSE_FILTER: {impulse_decision.value} (relax={impulse_relax})")
+                                
+                                # FUND MODE: jokio entry jei BLOCK
+                                if impulse_decision == ImpulseDecision.BLOCK:
+                                    bypass_min = adaptive_impulse_bypass_threshold()
+                                    if conf_score >= bypass_min:
+                                        print(f"  → ✅ IMPULSE_BYPASS: adaptive confluence {conf_score} (min={bypass_min})")
+                                    else:
+                                        print(f"  → ❌ FUND MODE: Entry blocked by impulse exhaustion filter (per vėlu)")
+                                        record_block("IMPULSE_FILTER")
+                                        continue
+                            except Exception as e:
+                                print(f"  → Impulse exhaustion filter error: {e}")
+                                # Continue if filter fails (fail-safe)
+                        except Exception as e:
+                            print(f"  → Confluence gate error: {e}")
+                            # Continue if filter fails (fail-safe)
+                    except Exception as e:
+                        print(f"  → Pullback entry engine error: {e}")
+                        # Continue if filter fails (fail-safe)
                 
                 # v8.9.23: RR ENGINE - Apply penalty/bonus from soft penalty system
                 rr_ratio = signal.get('rr_ratio', 0)
@@ -6279,24 +9958,33 @@ async def check_signals():
                 signal['score'] = density_result.final_score
                 signal['density_min_score'] = density_result.min_score_required
                 
+                if not profit_mode_allows(signal):
+                    print(f"  ⏸️ PROFIT MODE: Signal filtered ({signal.get('score', 0)}/{signal.get('confidence', 0):.2f})")
+                    record_block("PROFIT_MODE")
+                    continue
+
                 last_sig = last_signals.get(symbol, {})
                 last_signal_time = last_sig.get('time')
                 last_direction = last_sig.get('direction')
                 last_price = last_sig.get('price', 0)
-                cooldown = timedelta(hours=1)
+                cooldown = timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
                 
-                # Check for duplicate: same direction and similar price within cooldown
-                is_duplicate = False
+                # Hard cooldown per asset to avoid signal spam
                 if last_signal_time and (signal['time'] - last_signal_time) <= cooldown:
-                    if last_direction == signal['direction']:
-                        price_diff = abs(signal['price'] - last_price) / last_price if last_price else 0
-                        if price_diff < 0.02:  # Within 2% = duplicate
-                            is_duplicate = True
-                            print(f"  → Duplicate signal skipped (same direction, {price_diff*100:.1f}% price diff)")
-                
-                if is_duplicate:
-                    pass  # Skip duplicate
-                elif last_signal_time is None or (signal['time'] - last_signal_time) > cooldown:
+                    price_diff = abs(signal['price'] - last_price) / last_price if last_price else 0
+                    print(f"  → Signal on cooldown ({SIGNAL_COOLDOWN_MINUTES}m, price diff {price_diff*100:.1f}%)")
+                    continue
+                else:
+                    # HTF direction lock (cashflow/swing engines)
+                    try:
+                        processed = mode_router.route(TRADE_MODE, signal, direction_lock)
+                        if processed is None:
+                            print(f"  → HTF LOCK BLOCKED: {signal.get('direction')}")
+                            continue
+                        signal = processed
+                    except Exception as e:
+                        print(f"  ⚠️ HTF lock error: {e}")
+
                     # v8.9.19: Collect signal for sorted processing instead of immediate execution
                     collected_signals.append({
                         'symbol': symbol,
@@ -6306,8 +9994,55 @@ async def check_signals():
                         'confluence_score': signal.get('confluence_score', 0)
                     })
                     print(f"Signal sent: {asset_name} {signal['direction']}")
-                else:
-                    print(f"  → Signal on cooldown (1h)")
+
+                # ================================
+                # PROFIT MODE: QUICK STRATEGIES
+                # ================================
+                if PROFIT_MODE_ENABLED:
+                    quick_candidates = []
+                    if ENABLE_SCALPING:
+                        df_5m_quick = await fetch_ohlcv(symbol, TIMEFRAME_5M_OPTIMIZE, 60)
+                        scalp_signal = quick_strategies.generate_scalp_signal(df_5m_quick, asset_name)
+                        if scalp_signal:
+                            quick_candidates.append(scalp_signal)
+
+                    if ENABLE_SWING_TRADING:
+                        swing_signal = quick_strategies.generate_swing_signal(df_1h, asset_name)
+                        if swing_signal:
+                            quick_candidates.append(swing_signal)
+
+                    for quick in quick_candidates:
+                        quick_direction = "LONG" if quick['type'] == "LONG" else "SHORT"
+                        quick_signal = build_quick_signal(
+                            symbol=symbol,
+                            direction=quick_direction,
+                            base_price=current_price,
+                            strategy_name=quick['strategy'],
+                            confidence=quick['confidence'],
+                            profit_target_pct=quick['profit_target_pct'],
+                            stop_loss_pct=quick['stop_loss_pct']
+                        )
+                        quick_signal['confluence_score'] = signal.get('confluence_score', 0)
+                        if not profit_mode_allows(quick_signal):
+                            continue
+                        if quick_signal.get('confidence', 0) < MIN_SIGNAL_CONFIDENCE:
+                            print(f"  → {asset_name} {quick_direction} skipped: low confidence ({quick_signal.get('confidence', 0):.2f})")
+                            record_block("MIN_CONFIDENCE")
+                            continue
+
+                        quick_last = last_signals.get(symbol, {})
+                        quick_last_time = quick_last.get('time')
+                        if quick_last_time and (quick_signal['time'] - quick_last_time) <= cooldown:
+                            continue
+
+                        collected_signals.append({
+                            'symbol': symbol,
+                            'signal': quick_signal,
+                            'asset_name': asset_name,
+                            'score': quick_signal.get('score', 0),
+                            'confluence_score': quick_signal.get('confluence_score', 0)
+                        })
+                        print(f"  💰 Profit mode quick signal: {asset_name} {quick_direction} ({quick['strategy']})")
             
             await asyncio.sleep(0.5)
             
@@ -6356,6 +10091,11 @@ async def check_signals():
             signal = sig_data['signal']
             asset_name = sig_data['asset_name']
             
+            if signal.get('confidence', 0) < MIN_SIGNAL_CONFIDENCE:
+                print(f"  → {asset_name} skipped: low confidence ({signal.get('confidence', 0):.2f})")
+                record_block("MIN_CONFIDENCE")
+                continue
+
             # Send Telegram signal
             await send_telegram_signal(signal)
             
@@ -6370,6 +10110,8 @@ async def check_signals():
             # AUTO-TRADING EXECUTION (v8.6 + v8.9 Dynamic Leverage)
             # ================================
             if AUTO_TRADING_ENABLED:
+                original_entry_price = signal.get('price', 0)
+                
                 # v8.9.24: 5m Entry Optimizer - improve entry quality (does NOT block signals)
                 entry_optimized = True
                 try:
@@ -6391,9 +10133,367 @@ async def check_signals():
                             if entry_opt.score_boost > 0:
                                 signal['score'] = signal.get('score', 0) + entry_opt.score_boost
                                 print(f"  ✅ 5m entry boost: +{entry_opt.score_boost} score")
+                            
+                            # Use optimized limit price when safe
+                            optimized_price = entry_opt.optimized_price
+                            if (
+                                optimized_price
+                                and signal.get('entry_type') == "LIMIT"
+                                and original_entry_price > 0
+                            ):
+                                deviation_pct = abs(optimized_price - original_entry_price) / original_entry_price * 100
+                                if deviation_pct <= ENTRY_OPTIMIZED_MAX_DEVIATION_PCT:
+                                    sl_distance = abs(original_entry_price - signal['sl'])
+                                    tp1_distance = abs(signal['tp1'] - original_entry_price)
+                                    tp2_distance = abs(signal['tp2'] - original_entry_price)
+                                    tp3_distance = abs(signal['tp3'] - original_entry_price)
+                                    
+                                    signal['price'] = optimized_price
+                                    if signal['direction'] == "LONG":
+                                        signal['sl'] = optimized_price - sl_distance
+                                        signal['tp1'] = optimized_price + tp1_distance
+                                        signal['tp2'] = optimized_price + tp2_distance
+                                        signal['tp3'] = optimized_price + tp3_distance
+                                    else:
+                                        signal['sl'] = optimized_price + sl_distance
+                                        signal['tp1'] = optimized_price - tp1_distance
+                                        signal['tp2'] = optimized_price - tp2_distance
+                                        signal['tp3'] = optimized_price - tp3_distance
+                                    
+                                    print(f"  🎯 5m optimized LIMIT price: ${optimized_price:.2f} (dev {deviation_pct:.2f}%)")
                 except Exception as e:
                     print(f"  ⚠️ 5m optimizer error: {e}")
                 
+                # ================================
+                # FUND ENTRY FLOW v1.0 - Centralized entry decision engine
+                # futures_signals.py renka duomenis + kviečia entry_flow
+                # ================================
+                try:
+                    # Fetch required dataframes
+                    df_15m_fund = await fetch_ohlcv(symbol, TIMEFRAME_ENTRY, 100)
+                    df_1h_fund = await fetch_ohlcv(symbol, TIMEFRAME_TREND, 100)
+                    df_4h_fund = await fetch_ohlcv(symbol, TIMEFRAME_MACRO, 100)
+                    
+                    # Get current trend and regime
+                    current_trend = signal.get('trend', 'NEUTRAL')
+                    current_regime = market_regime_state.get('regime', 'NEUTRAL')
+                    current_price = signal.get('price', 0)
+                    direction = signal.get('direction', 'LONG')
+                    sl = signal.get('sl', 0)
+                    tp1 = signal.get('tp1', 0)
+                    
+                    # Default values (fail-safe)
+                    htf_trend = "NEUTRAL"
+                    trend_4h = "NEUTRAL"
+                    htf_structure_ok = False
+                    near_ob = False
+                    near_fvg = False
+                    near_range_low = False
+                    distance_from_vwap_pct = 0.0
+                    ema_distance = 0.0
+                    rsi_val = 50.0
+                    impulse_pct = 0.0
+                    impulse_atr_mult = 0.0
+                    ltf_structure = False
+                    ltf_candle_close_ok = True
+                    rr_estimated = 1.5
+                    fees_rr_penalty = 0.0
+                    
+                    # 1. HTF Trend & Structure (1H)
+                    if current_trend in ["STRONG_BULL", "BULL"]:
+                        htf_trend = current_trend
+                    elif current_trend in ["STRONG_BEAR", "BEAR"]:
+                        htf_trend = "BEAR"
+                    else:
+                        htf_trend = "RANGE"
+                    
+                    # 1a. Determine 4H Trend (for context only - not blocking)
+                    if df_4h_fund is not None and len(df_4h_fund) >= 50:
+                        try:
+                            # Simple trend detection using EMA and price
+                            close_4h = df_4h_fund['close']
+                            ema21_4h = calc_ema(close_4h, 21)
+                            ema50_4h = calc_ema(close_4h, 50)
+                            
+                            if len(ema21_4h) > 0 and len(ema50_4h) > 0:
+                                ema21_val = ema21_4h.iloc[-1]
+                                ema50_val = ema50_4h.iloc[-1]
+                                price_4h = close_4h.iloc[-1]
+                                
+                                # Strong trend: EMA alignment + price above/below
+                                if ema21_val > ema50_val and price_4h > ema21_val:
+                                    trend_4h = "STRONG_BULL"
+                                elif ema21_val > ema50_val:
+                                    trend_4h = "BULL"
+                                elif ema21_val < ema50_val and price_4h < ema21_val:
+                                    trend_4h = "STRONG_BEAR"
+                                elif ema21_val < ema50_val:
+                                    trend_4h = "BEAR"
+                                else:
+                                    trend_4h = "NEUTRAL"
+                        except Exception as e:
+                            # Default to NEUTRAL if calculation fails
+                            trend_4h = "NEUTRAL"
+                    
+                    # Check HTF structure (BOS/CHoCH)
+                    if df_1h_fund is not None and len(df_1h_fund) >= 50:
+                        try:
+                            structure_result = analyze_market_structure(df_1h_fund, lookback=50)
+                            htf_structure_ok = (
+                                structure_result.get('structure_break') is not None or
+                                structure_result.get('choch') is not None
+                            )
+                        except:
+                            pass
+
+                    # STRUCTURE HOLD (HTF candles)
+                    htf_bias = trend_4h
+                    structure_hold_ok = False
+                    ll_printed = False
+                    strong_bear_impulse = False
+                    bearish_impulse_flag = False
+                    resistance_break = False
+                    zone_accepted = False
+                    next_candle_bullish = False
+                    supply_rejection_guard = False
+                    try:
+                        htf_candles = df_4h_fund[["open", "high", "low", "close"]].to_dict("records") if df_4h_fund is not None else []
+                        structure_hold_ok = structure_hold(htf_candles, "LONG" if direction == "LONG" else "SHORT")
+                        ll_printed = lower_low_printed(htf_candles) if htf_candles else False
+                        bearish_impulse_flag = bearish_impulse(df_4h_fund)
+                        strong_bear_impulse = bearish_impulse_flag
+                        if supply_zone and df_15m_fund is not None and len(df_15m_fund) >= 2:
+                            zone_high = supply_zone.top
+                            breakout_candle = df_15m_fund.iloc[-2]
+                            confirm_candle = df_15m_fund.iloc[-1]
+                            resistance_break = breakout_candle["high"] > zone_high
+                            breakout_range = breakout_candle["high"] - breakout_candle["low"]
+                            breakout_body = abs(breakout_candle["close"] - breakout_candle["open"])
+                            breakout_body_pct = breakout_body / breakout_range if breakout_range > 0 else 0
+                            zone_accepted = (breakout_candle["close"] > zone_high) and (breakout_body_pct >= 0.6)
+                            next_candle_bullish = confirm_candle["close"] >= confirm_candle["open"]
+                            confirm_range = confirm_candle["high"] - confirm_candle["low"]
+                            confirm_body = abs(confirm_candle["close"] - confirm_candle["open"])
+                            confirm_body_pct = confirm_body / confirm_range if confirm_range > 0 else 0
+                            touched_supply = breakout_candle["high"] >= zone_high
+                            closed_below_supply = breakout_candle["close"] < zone_high
+                            next_candle_weak = (confirm_candle["close"] < confirm_candle["open"]) or (confirm_body_pct < 0.3)
+                            supply_rejection_guard = touched_supply and closed_below_supply and next_candle_weak
+                    except Exception:
+                        structure_hold_ok = False
+                    signal_quality = "NEUTRAL"
+                    if htf_bias == "STRONG_BULL" and direction == "LONG":
+                        signal_quality = "HIGH" if structure_hold_ok else "LOW"
+                    if htf_bias == "STRONG_BEAR" and direction == "SHORT":
+                        signal_quality = "HIGH" if structure_hold_ok else "LOW"
+                    
+                    # 2. Regime
+                    if current_regime not in ["TREND", "BULL", "BEAR", "RANGE", "CHAOTIC"]:
+                        current_regime = "TREND"  # Default fail-safe
+                    
+                    # 3. Location (OB/FVG/Range Low)
+                    if df_15m_fund is not None and len(df_15m_fund) >= 20:
+                        try:
+                            zone_check = OrderBlocks.is_price_at_key_zone(
+                                df_15m_fund, direction, tolerance_pct=0.8
+                            )
+                            near_ob = zone_check.get('zone_type') == 'ORDER_BLOCK'
+                            near_fvg = zone_check.get('zone_type') == 'FVG'
+                            # Range low: check if price is near recent low
+                            if len(df_15m_fund) >= 20:
+                                recent_low = df_15m_fund['low'].iloc[-20:].min()
+                                near_range_low = abs(current_price - recent_low) / current_price < 0.005  # Within 0.5%
+                        except:
+                            pass
+                    
+                    # 4. VWAP Distance
+                    if df_1h_fund is not None and len(df_1h_fund) >= 50:
+                        try:
+                            vwap_series = calc_vwap(df_1h_fund, period=50)
+                            if vwap_series is not None and len(vwap_series) > 0:
+                                vwap_value = vwap_series.iloc[-1]
+                                distance_from_vwap_pct = abs(current_price - vwap_value) / vwap_value * 100
+                        except:
+                            pass
+                    
+                    # 4b. EMA distance (15m EMA9)
+                    if df_15m_fund is not None and len(df_15m_fund) >= 9 and current_price > 0:
+                        try:
+                            ema9 = calc_ema(df_15m_fund['close'], 9).iloc[-1]
+                            if ema9:
+                                ema_distance = abs(current_price - ema9) / current_price * 100
+                        except:
+                            pass
+                    
+                    # 5. RSI & Impulse
+                    if df_15m_fund is not None and len(df_15m_fund) >= 14:
+                        try:
+                            rsi_series = calc_rsi(df_15m_fund['close'], period=14)
+                            if rsi_series is not None and len(rsi_series) > 0:
+                                rsi_val = float(rsi_series.iloc[-1])
+                        except:
+                            pass
+                    
+                    # Calculate impulse (price movement over last N candles)
+                    if df_15m_fund is not None and len(df_15m_fund) >= 10:
+                        try:
+                            lookback = 5  # Last 5 candles
+                            price_start = df_15m_fund['close'].iloc[-lookback]
+                            price_end = df_15m_fund['close'].iloc[-1]
+                            impulse_pct = abs(price_end - price_start) / price_start * 100
+                            
+                            # Impulse in ATR multiples
+                            atr_series = calc_atr(df_15m_fund, period=14)
+                            if atr_series is not None and len(atr_series) > 0:
+                                atr_value = float(atr_series.iloc[-1])
+                                impulse_atr_mult = abs(price_end - price_start) / atr_value if atr_value > 0 else 0
+                        except:
+                            pass
+                    
+                    # 6. Lower TF Structure (micro BOS/CHoCH on 15m)
+                    if df_15m_fund is not None and len(df_15m_fund) >= 30:
+                        try:
+                            # Simple structure check: price making higher highs (LONG) or lower lows (SHORT)
+                            recent_highs = df_15m_fund['high'].iloc[-20:]
+                            recent_lows = df_15m_fund['low'].iloc[-20:]
+                            
+                            if direction == "LONG":
+                                # Bullish structure: recent high > previous high
+                                if len(recent_highs) >= 2:
+                                    ltf_structure = recent_highs.iloc[-1] > recent_highs.iloc[-2]
+                            else:  # SHORT
+                                # Bearish structure: recent low < previous low
+                                if len(recent_lows) >= 2:
+                                    ltf_structure = recent_lows.iloc[-1] < recent_lows.iloc[-2]
+                        except:
+                            pass
+                    
+                    # 7. Candle close OK (no wick entry)
+                    if df_15m_fund is not None and len(df_15m_fund) >= 1:
+                        try:
+                            last_candle = df_15m_fund.iloc[-1]
+                            candle_body = abs(last_candle['close'] - last_candle['open'])
+                            candle_range = last_candle['high'] - last_candle['low']
+                            # Good close: body is significant portion of range (no large wicks)
+                            if candle_range > 0:
+                                body_ratio = candle_body / candle_range
+                                ltf_candle_close_ok = body_ratio >= 0.5  # At least 50% body
+                        except:
+                            pass
+                    
+                    # 8. R:R & Fees
+                    if current_price > 0 and sl > 0 and tp1 > 0:
+                        if direction == "LONG":
+                            sl_distance = abs(current_price - sl) / current_price
+                            tp_distance = abs(tp1 - current_price) / current_price
+                        else:  # SHORT
+                            sl_distance = abs(sl - current_price) / current_price
+                            tp_distance = abs(current_price - tp1) / current_price
+                        
+                        if sl_distance > 0:
+                            rr_estimated = tp_distance / sl_distance
+                            
+                            # Calculate fees penalty (using Kraken fees)
+                            # Taker fee: 0.05% entry + 0.05% exit = 0.1% total
+                            # Convert to R:R penalty
+                            fee_pct = 0.001  # 0.1% total fees
+                            fees_rr_penalty = fee_pct / sl_distance if sl_distance > 0 else 0.0
+                    
+                    # Build MarketContext
+                    market_ctx = MarketContext(
+                        symbol=symbol,
+                        htf_trend=htf_trend,
+                        htf_structure_ok=htf_structure_ok,
+                        regime=current_regime,
+                        trend_4h=trend_4h,
+                        direction=direction,
+                        near_ob=near_ob,
+                        near_fvg=near_fvg,
+                        near_range_low=near_range_low,
+                        distance_from_vwap_pct=distance_from_vwap_pct,
+                        ema_distance=ema_distance,
+                        rsi=rsi_val,
+                        impulse_pct=impulse_pct,
+                        impulse_atr_mult=impulse_atr_mult,
+                        ltf_structure=ltf_structure,
+                        ltf_candle_close_ok=ltf_candle_close_ok,
+                        rr_estimated=rr_estimated,
+                        fees_rr_penalty=fees_rr_penalty,
+                        htf_bos=htf_state.get("bos"),
+                        in_supply_zone=in_supply_zone,
+                        in_demand_zone=in_demand_zone,
+                        htf_supply_breakout=htf_supply_breakout,
+                        htf_demand_breakdown=htf_demand_breakdown,
+                        near_supply_zone=near_supply_zone,
+                        near_demand_zone=near_demand_zone,
+                        htf_bias=htf_bias,
+                        structure_hold=structure_hold_ok,
+                        signal_quality=signal_quality,
+                        strong_bear_impulse=strong_bear_impulse,
+                        ll_printed=ll_printed,
+                        bearish_impulse=bearish_impulse_flag,
+                        resistance_break=resistance_break,
+                        zone_accepted=zone_accepted,
+                        next_candle_bullish=next_candle_bullish,
+                        supply_rejection_guard=supply_rejection_guard,
+                        zone_interaction=zone_interaction.value,
+                        regime_flip=regime_flip_state,
+                        expansion_bias=expansion_bias_state,
+                        range_atr=range_atr
+                    )
+                    
+                    # Evaluate entry (async) - entry_flow.py sprendžia
+                    decision, reason, ema_multiplier = await evaluate_entry(market_ctx)
+                    
+                    if decision in (SignalDecision.WAIT, SignalDecision.NO_TRADE):
+                        print(f"  ❌ ENTRY BLOCKED [{asset_name}] - {reason}")
+                        print(f"     FUND FLOW: HTF={market_ctx.htf_trend}, Regime={market_ctx.regime}, "
+                              f"4H (context): {market_ctx.trend_4h}, RSI={market_ctx.rsi:.1f}, RR={market_ctx.rr_estimated:.2f}")
+                        if decision == SignalDecision.WAIT:
+                            now = datetime.now(timezone.utc)
+                            zone_label = zone_context_type or "ZONE"
+                            wait_state = f"{zone_label}:{zone_interaction.value}"
+                            last_wait = zone_wait_status.get(symbol)
+                            should_send = (
+                                not last_wait
+                                or last_wait.get("state") != wait_state
+                                or (now - last_wait.get("last_sent", now)).total_seconds() >= ZONE_WAIT_STATUS_COOLDOWN_MIN * 60
+                            )
+                            if should_send:
+                                await send_telegram_status(
+                                    "🟡 <b>MARKET STATE: WAIT</b>\n"
+                                    f"{asset_name}: Price interacting with {zone_label} zone\n"
+                                    "Awaiting rejection or breakout confirmation"
+                                )
+                                zone_wait_status[symbol] = {"state": wait_state, "last_sent": now}
+                        continue
+                    else:
+                        # Calculate risk modifier based on 4H trend context
+                        risk_modifier = calculate_risk_modifier(market_ctx)
+                        
+                        print(f"  ✅ ENTRY ALLOWED [{asset_name}] - FUND FLOW")
+                        print(f"     HTF={market_ctx.htf_trend}, Regime={market_ctx.regime}, "
+                              f"4H (context): {market_ctx.trend_4h}, Location={'OB' if market_ctx.near_ob else 'FVG' if market_ctx.near_fvg else 'Range' if market_ctx.near_range_low else 'N/A'}, "
+                              f"RSI={market_ctx.rsi:.1f}, RR={market_ctx.rr_estimated:.2f}, Risk Modifier={risk_modifier}, "
+                              f"HTF_BIAS={market_ctx.htf_bias}, STRUCT_HOLD={market_ctx.structure_hold}, QUALITY={market_ctx.signal_quality}")
+                        
+                        # Store risk_modifier for use in open_position
+                        signal['risk_modifier'] = risk_modifier
+                        
+                        if ema_multiplier < 1.0:
+                            signal['size_multiplier'] = signal.get('size_multiplier', 1.0) * ema_multiplier
+                            print(f"     📉 EMA distance risk reduction: ×{ema_multiplier:.2f}")
+                except Exception as e:
+                    print(f"  ⚠️ FUND entry flow error: {e}")
+                    # Fail-safe: continue if FUND flow fails
+                    # In production, you might want to block on error for safety
+                
+                if PROFIT_MODE_ENABLED:
+                    can_trade, reason = profit_tracker.should_trade_more()
+                    if not can_trade:
+                        print(f"⏸️ {reason}")
+                        continue  # Skip this trade
+
                 trade_result = await open_position(
                     symbol=symbol,
                     direction=signal['direction'],
@@ -6406,7 +10506,10 @@ async def check_signals():
                     ml_confidence=signal.get('ml_confidence'),
                     confirmation_count=signal.get('confirmation_count', 0),
                     entry_type=signal.get('entry_type', 'MARKET'),  # v8.9.24: LIMIT/MARKET support
-                    scalp_rebound_multiplier=signal.get('scalp_rebound_multiplier', 1.0)
+                    scalp_rebound_multiplier=signal.get('scalp_rebound_multiplier', 1.0),
+                    strategy_name=signal.get('strategy_name', 'TREND_CONTINUATION'),  # Strategy identification
+                    size_multiplier=signal.get('size_multiplier', 1.0),  # Strategy health size multiplier
+                    risk_modifier=signal.get('risk_modifier', 1.0)  # 4H trend context risk modifier
                 )
                 
                 if trade_result['success']:
@@ -6427,13 +10530,18 @@ async def check_signals():
     bot_stats["last_check"] = datetime.now(timezone.utc)
 
 async def signal_loop():
+    # Setup FUND entry flow logger
+    set_risk_event_logger(log_risk_event)
+    
     print("🚀 Futures Signal Bot v8.9.24 PRO Started!")
     print("📊 v8.9.24: 5m Entry Optimizer (FUND MODE) - 5m tik pagerina entry, neblokuoja signalų!")
     print(f"📊 Assets: {', '.join(ASSET_NAMES.values())}")
     print(f"⏱️ Timeframes: {TIMEFRAME_MACRO} (macro) | {TIMEFRAME_TREND} (trend) | {TIMEFRAME_ENTRY} (entry) | {TIMEFRAME_5M_OPTIMIZE} (optimize)")
     print(f"📱 Telegram: {'Configured' if TELEGRAM_TOKEN else 'NOT CONFIGURED'}")
     print(f"🤖 AUTO-TRADING: {'ON - $' + str(AUTO_TRADE_MARGIN_USD) + ' margin/trade, max ' + str(AUTO_TRADE_MAX_POSITIONS) + ' positions' if AUTO_TRADING_ENABLED else 'OFF'}")
-    print(f"💰 Daily Loss Limit: ${DAILY_LOSS_LIMIT_USD}")
+    print(f"💰 Daily Loss Limit: -{DAILY_LOSS_LIMIT_PCT}% (${DAILY_LOSS_LIMIT_USD} fallback)")
+    print(f"📊 Weekly Loss Limit: -{WEEKLY_LOSS_LIMIT_PCT}%")
+    print(f"📉 Maximum Drawdown: -{MAX_DRAWDOWN_PCT}% from peak equity")
     print(f"📈 Trailing Stop: {'ENABLED' if TRAILING_ENABLED else 'DISABLED'} ({TRAILING_DISTANCE_PCT}%)")
     print(f"🛡️ Breakeven at TP1: {'YES' if BREAKEVEN_AT_TP1 else 'NO'}")
     print(f"🤖 Partial TP: {'ON - Auto-close 33% at TP1 & TP2' if PARTIAL_TP_ENABLED else 'OFF'}")
@@ -6441,6 +10549,7 @@ async def signal_loop():
     print(f"📉 Market Regime: {'ON' if MARKET_REGIME_ENABLED else 'OFF'}")
     print(f"🌐 Macro Filters: SPY={'ON' if SPY_ENABLED else 'OFF'} VIX={'ON' if VIX_ENABLED else 'OFF'} DXY={'ON' if DXY_ENABLED else 'OFF'}")
     print(f"📍 Position Tracking: {'ON - Skips signals for open positions' if POSITION_TRACKING_ENABLED else 'OFF - No API keys'}")
+    print(f"🛡️ FUND Entry Flow: ERROR HANDLING ENABLED - Critical errors will block entry")
     
     # v8.9.14+: Multi-Collateral balance check
     if POSITION_TRACKING_ENABLED:
@@ -6449,23 +10558,55 @@ async def signal_loop():
     
     # Initial macro checks
     print("\n--- Running initial macro checks ---")
-    detect_market_regime()
+    detect_macro_market_regime()
     get_spy_data()
     run_macro_checks()
     
     # v8.9.3: Run quant analysis at startup for counter-trend signals
     global quant_results, quant_correlation, quant_last_update
-    print("\n🧮 Running initial quant analysis...")
+    if QUANT_ENABLED:
+        print("\n🧮 Running initial quant analysis...")
+        try:
+            quant_results, quant_correlation = run_quant_analysis_sync()
+            if not quant_results:
+                cached = _load_quant_cache()
+                if cached and cached.get("assets"):
+                    quant_results = cached.get("assets", {})
+                    quant_correlation = cached.get("correlation")
+                    cached_update = cached.get("last_update")
+                    if cached_update:
+                        try:
+                            quant_last_update = datetime.fromisoformat(cached_update)
+                        except Exception:
+                            quant_last_update = datetime.now()
+            else:
+                quant_last_update = datetime.now()
+                _save_quant_cache(quant_results, quant_correlation, quant_last_update)
+            for asset, data in quant_results.items():
+                if data:
+                    bias, signals = quant_engine.get_quant_signal_bias(data)
+                    print(f"  📊 {asset}: Quant Bias = {bias:+d}")
+            print("✅ Quant analysis ready!")
+        except Exception as e:
+            print(f"⚠️ Quant analysis failed: {e}")
+    else:
+        quant_results = {}
+        quant_correlation = None
+        quant_last_update = None
+
+    # Market intel (structure analytics)
+    global market_intel_results, market_intel_last_update
     try:
-        quant_results, quant_correlation = quant_engine.run_all_assets()
-        quant_last_update = datetime.now()
-        for asset, data in quant_results.items():
+        print("\n🧠 Running market intel analysis...")
+        market_intel_results = run_market_intel_sync()
+        market_intel_last_update = datetime.now(timezone.utc)
+        _save_market_intel_cache(market_intel_results, market_intel_last_update)
+        for asset, data in market_intel_results.items():
             if data:
-                bias, signals = quant_engine.get_quant_signal_bias(data)
-                print(f"  📊 {asset}: Quant Bias = {bias:+d}")
-        print("✅ Quant analysis ready!")
+                print(f"  🧠 {asset}: {data.get('bias', 'NEUTRAL')} | {data.get('structure', 'RANGE')} | {data.get('trend_4h', 'NEUTRAL')}")
+        print("✅ Market intel ready!")
     except Exception as e:
-        print(f"⚠️ Quant analysis failed: {e}")
+        print(f"⚠️ Market intel failed: {e}")
     
     next_fomc = get_next_fomc()
     if next_fomc:
@@ -6480,6 +10621,20 @@ async def signal_loop():
     # Load existing Kraken positions for trailing stop management
     await load_existing_positions_for_trailing()
     
+    # v8.9.25: Initialize peak equity if not set (first run or after state reset)
+    current_equity = get_current_equity()
+    if auto_trading_state.get("peak_equity", 0.0) == 0.0 and current_equity > 0:
+        auto_trading_state["peak_equity"] = current_equity
+        auto_trading_state["peak_equity_date"] = datetime.now(timezone.utc).isoformat()
+        print(f"📈 Initial peak equity set: ${current_equity:.2f}")
+    elif current_equity > 0:
+        # Update peak if current is higher (in case equity increased while bot was off)
+        update_peak_equity(current_equity)
+        peak = auto_trading_state.get("peak_equity", 0.0)
+        if peak > 0:
+            drawdown_pct = ((peak - current_equity) / peak * 100) if peak > 0 else 0.0
+            print(f"📊 Peak equity: ${peak:.2f} | Current: ${current_equity:.2f} | Drawdown: {drawdown_pct:.2f}%")
+    
     # v8.6: Double-check positions before auto-trading starts (prevent duplicate trades)
     if AUTO_TRADING_ENABLED:
         print("\n🔄 Verifying Kraken positions before auto-trading...")
@@ -6493,23 +10648,37 @@ async def signal_loop():
     # Send initial heartbeat on startup
     await send_heartbeat()
     
+    CHECK_SIGNALS_TIMEOUT = 180  # seconds
     while True:
         try:
             # v8.6: Reset daily stats at midnight UTC
             reset_daily_stats()
             
-            # v8.9.23: Heartbeat only on startup (removed periodic sending)
-            # Heartbeat is sent once at bot startup in line 5981
+            # Periodic heartbeat (2h) to confirm bot is alive
+            last_heartbeat = bot_stats.get("last_heartbeat")
+            if not last_heartbeat or (datetime.now(timezone.utc) - last_heartbeat).total_seconds() >= HEARTBEAT_INTERVAL:
+                await send_heartbeat()
             
             # Run macro checks every hour
             if (datetime.now(timezone.utc) - last_macro_check).total_seconds() >= 3600:
                 print("\n--- Hourly macro update ---")
-                detect_market_regime()
+                detect_macro_market_regime()
                 get_spy_data()
                 run_macro_checks()
                 
                 print(f"Regime: {market_regime_state['regime']} | SPY: {spy_state['trend']} | VIX: {macro_state['vix_level']}")
                 last_macro_check = datetime.now(timezone.utc)
+
+            # Refresh market intel periodically
+            if (market_intel_last_update is None or
+                (datetime.now(timezone.utc) - market_intel_last_update).total_seconds() >= MARKET_INTEL_REFRESH_INTERVAL):
+                try:
+                    market_intel_results = run_market_intel_sync()
+                    market_intel_last_update = datetime.now(timezone.utc)
+                    _save_market_intel_cache(market_intel_results, market_intel_last_update)
+                    print("🧠 Market intel refreshed")
+                except Exception as e:
+                    print(f"⚠️ Market intel refresh failed: {e}")
             
             # Check if auto-trading is paused due to daily loss limit
             if AUTO_TRADING_ENABLED and auto_trading_state['is_paused']:
@@ -6523,17 +10692,30 @@ async def signal_loop():
             if is_blackout:
                 print(f"🏛️ FOMC BLACKOUT ACTIVE - Signals paused until {(fomc_date + timedelta(hours=FOMC_BLACKOUT_HOURS_AFTER)).strftime('%H:%M')} UTC")
             
-            await check_signals()
+            try:
+                await asyncio.wait_for(check_signals(), timeout=CHECK_SIGNALS_TIMEOUT)
+            except asyncio.TimeoutError:
+                print(f"⚠️ check_signals timeout after {CHECK_SIGNALS_TIMEOUT}s - skipping cycle")
             
             # Manage open positions (trailing stops)
             if TRAILING_ENABLED and open_positions:
                 print(f"\n--- Managing {len(open_positions)} open position(s) ---")
                 await manage_open_positions()
             
+            # v8.9.25: Update peak equity periodically (after each cycle)
+            current_equity = get_current_equity()
+            update_peak_equity(current_equity)
+            
+            # Adaptive filters status (periodic)
+            maybe_log_adaptive_status()
+            
             # Increment cycle counters
             bot_stats["cycles_completed"] += 1
             bot_stats["cycles_success"] += 1
             bot_stats["consecutive_errors"] = 0  # Reset error counter on success
+            
+            # Save state periodically
+            save_bot_state()
             
             await asyncio.sleep(CHECK_INTERVAL)
         except Exception as e:
@@ -6962,6 +11144,40 @@ def api_stats():
         },
     })
 
+@app.route('/api/profit')
+def api_profit():
+    now = datetime.now(timezone.utc)
+    next_reset = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    seconds_to_reset = int((next_reset - now).total_seconds())
+    hours = seconds_to_reset // 3600
+    minutes = (seconds_to_reset % 3600) // 60
+
+    current_target = auto_adjust_targets.current_target if AUTO_ADJUST_TARGETS_ENABLED else DAILY_PROFIT_TARGET_EUR
+    daily_profit = profit_tracker.daily_profit
+    daily_trades = profit_tracker.daily_trades
+    daily_wins = auto_trading_state.get("daily_wins", 0)
+    win_rate = (daily_wins / max(1, daily_trades)) * 100 if daily_trades else 0
+    avg_profit = daily_profit / daily_trades if daily_trades else 0.0
+
+    return jsonify({
+        "daily_profit": round(daily_profit, 2),
+        "daily_target": round(current_target, 2),
+        "daily_trades": daily_trades,
+        "win_rate": round(win_rate, 1),
+        "avg_profit": round(avg_profit, 2),
+        "time_until_reset": f"{hours:02d}:{minutes:02d}",
+    })
+
+@app.route('/api/assets/top')
+def api_top_assets():
+    top_assets = asset_performance.get_best_assets()
+    return jsonify({
+        "assets": [
+            {"asset": asset, "win_rate": round(win_rate, 1), "avg_profit": round(avg_profit, 2)}
+            for asset, win_rate, avg_profit in top_assets
+        ]
+    })
+
 @app.route('/api/balance')
 def api_balance():
     """Gauti detalų Multi-Collateral balansą"""
@@ -7160,6 +11376,59 @@ def share_page():
     '''
     return share_html
 
+@app.route('/api/positions')
+def api_positions():
+    """Gauti atviras pozicijas - naudoja open_positions dict"""
+    positions_data = []
+    for symbol in FUTURES_ASSETS:
+        asset_name = ASSET_NAMES.get(symbol, symbol)
+        pos = open_positions.get(symbol)
+        
+        if pos:
+            # Get current price (use highest/lowest for P&L calculation)
+            if pos['direction'] == "LONG":
+                current_price = pos.get('highest_price', pos['entry_price'])
+                pnl_pct = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
+            else:
+                current_price = pos.get('lowest_price', pos['entry_price'])
+                pnl_pct = ((pos['entry_price'] - current_price) / pos['entry_price']) * 100
+            
+            positions_data.append({
+                "asset": asset_name,
+                "active": True,
+                "direction": pos['direction'],
+                "entry": pos['entry_price'],
+                "current_price": current_price,
+                "pnl_pct": pnl_pct,
+                "sl": pos.get('current_sl', pos.get('sl', 0)),
+                "tp1": pos.get('tp1', 0),
+                "tp2": pos.get('tp2', 0),
+                "tp3": pos.get('tp3', 0),
+                "trailing_active": pos.get('trailing_active', False),
+                "breakeven_active": pos.get('breakeven_active', False),
+                "tp1_hit": pos.get('tp1_hit', False),
+                "tp2_hit": pos.get('tp2_hit', False),
+            })
+        else:
+            positions_data.append({
+                "asset": asset_name,
+                "active": False,
+                "direction": "",
+                "entry": 0,
+                "current_price": 0,
+                "pnl_pct": 0,
+                "sl": 0,
+                "tp1": 0,
+                "tp2": 0,
+                "tp3": 0,
+                "trailing_active": False,
+                "breakeven_active": False,
+                "tp1_hit": False,
+                "tp2_hit": False,
+            })
+    
+    return jsonify(positions_data)
+
 @app.route('/api/signals')
 def api_signals():
     return jsonify([{
@@ -7170,13 +11439,10 @@ def api_signals():
         "price": s['price'],
         "sl": s['sl'],
         "tp1": s['tp1'],
-        "score": s['score'],
-        "time": s['time'].strftime('%H:%M UTC')
+        "score": s.get('score', 0),
+        "trend": s.get('trend', 'NEUTRAL'),
+        "time": s['time'].strftime('%H:%M UTC') if isinstance(s['time'], datetime) else s.get('time', 'N/A')
     } for s in reversed(signals_history[-20:])])
-
-@app.route('/api/positions')
-def api_positions():
-    """Gauti atviras pozicijas su REALAUS LAIKO kainomis iš Kraken"""
     positions = []
     
     # Symbol mapping for ticker fetch
@@ -7250,6 +11516,406 @@ def api_bot_status():
         "open_positions": len([p for p in open_positions.values() if p]),
     })
 
+@app.route('/api/pnl/realtime')
+def api_pnl_realtime():
+    """
+    Real-time P&L tracking endpoint
+    Returns current P&L for all open positions and total P&L
+    """
+    try:
+        balance = get_available_balance()
+        capital = balance.get("total_usd", 0)
+        
+        # Calculate P&L for all open positions
+        total_unrealized_pnl_usd = 0.0
+        total_unrealized_pnl_pct = 0.0
+        positions_pnl = []
+        
+        TICKER_SYMBOLS = {
+            "PF_XBTUSD": "BTC/USD:USD",
+            "PF_ETHUSD": "ETH/USD:USD",
+            "PF_SOLUSD": "SOL/USD:USD",
+            "PF_XRPUSD": "XRP/USD:USD",
+            "PF_LTCUSD": "LTC/USD:USD",
+            "PF_ADAUSD": "ADA/USD:USD",
+            "PF_DOTUSD": "DOT/USD:USD",
+        }
+        
+        for symbol, pos in open_positions.items():
+            if not pos:
+                continue
+            
+            asset_name = ASSET_NAMES.get(symbol, symbol)
+            entry_price = pos.get('entry_price', 0)
+            direction = pos.get('direction', 'LONG')
+            contracts = pos.get('size', 0)
+            size_usd = pos.get('size_usd', 0)
+            
+            # Get current price
+            try:
+                ticker_symbol = TICKER_SYMBOLS.get(symbol)
+                if ticker_symbol:
+                    ticker = exchange.fetch_ticker(ticker_symbol)
+                    current_price = ticker.get('last', entry_price) or entry_price
+                else:
+                    current_price = entry_price
+            except:
+                current_price = entry_price
+            
+            # Calculate P&L
+            if entry_price > 0 and contracts > 0:
+                if direction == "LONG":
+                    pnl_pct = (current_price - entry_price) / entry_price * 100
+                    pnl_usd = (current_price - entry_price) * contracts
+                else:
+                    pnl_pct = (entry_price - current_price) / entry_price * 100
+                    pnl_usd = (entry_price - current_price) * contracts
+                
+                total_unrealized_pnl_usd += pnl_usd
+                positions_pnl.append({
+                    "symbol": symbol,
+                    "asset": asset_name,
+                    "direction": direction,
+                    "entry_price": entry_price,
+                    "current_price": current_price,
+                    "pnl_usd": round(pnl_usd, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "size_usd": size_usd,
+                    "contracts": contracts,
+                })
+        
+        # Calculate total P&L percentage
+        if capital > 0:
+            total_unrealized_pnl_pct = (total_unrealized_pnl_usd / capital) * 100
+        
+        # Realized P&L (from closed trades)
+        daily_realized_pnl = auto_trading_state.get("daily_pnl", 0)
+        weekly_realized_pnl = auto_trading_state.get("weekly_pnl", 0)
+        total_realized_pnl = weekly_realized_pnl  # Total realized
+        
+        # Total P&L (realized + unrealized)
+        total_pnl_usd = total_realized_pnl + total_unrealized_pnl_usd
+        total_pnl_pct = (total_pnl_usd / capital * 100) if capital > 0 else 0
+        
+        return jsonify({
+            "unrealized": {
+                "total_usd": round(total_unrealized_pnl_usd, 2),
+                "total_pct": round(total_unrealized_pnl_pct, 2),
+                "positions": positions_pnl,
+                "count": len(positions_pnl),
+            },
+            "realized": {
+                "daily_usd": round(daily_realized_pnl, 2),
+                "weekly_usd": round(weekly_realized_pnl, 2),
+                "total_usd": round(total_realized_pnl, 2),
+            },
+            "total": {
+                "pnl_usd": round(total_pnl_usd, 2),
+                "pnl_pct": round(total_pnl_pct, 2),
+                "capital": round(capital, 2),
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        print(f"⚠️ P&L realtime endpoint error: {e}")
+        return jsonify({
+            "error": str(e),
+            "unrealized": {"total_usd": 0, "total_pct": 0, "positions": [], "count": 0},
+            "realized": {"daily_usd": 0, "weekly_usd": 0, "total_usd": 0},
+            "total": {"pnl_usd": 0, "pnl_pct": 0, "capital": 0},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+@app.route('/api/strategy/performance')
+def api_strategy_performance():
+    """
+    Strategy performance metrics endpoint
+    Returns performance statistics for each strategy
+    """
+    try:
+        data = load_signal_results()
+        strategy_stats = {}
+        
+        # Initialize all strategies
+        for strategy in STRATEGY_LIST:
+            strategy_stats[strategy] = {
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "total_profit_pct": 0.0,
+                "avg_profit_pct": 0.0,
+                "avg_win_pct": 0.0,
+                "avg_loss_pct": 0.0,
+                "expectancy": 0.0,
+                "profit_factor": 0.0,
+                "recent_trades": [],
+                "status": "ACTIVE",  # ACTIVE, WARNING, DISABLED
+            }
+        
+        # Calculate stats for each strategy
+        for signal in data.get("signals", []):
+            strategy = signal.get("strategy", "TREND_CONTINUATION")
+            result = signal.get("result")
+            profit_pct = signal.get("profit_pct", 0.0)
+            
+            if strategy not in strategy_stats:
+                continue
+            
+            if result in ("WIN", "LOSS"):
+                stats = strategy_stats[strategy]
+                stats["total_trades"] += 1
+                
+                if result == "WIN":
+                    stats["wins"] += 1
+                    stats["total_profit_pct"] += profit_pct
+                else:
+                    stats["losses"] += 1
+                    stats["total_profit_pct"] += profit_pct  # Negative for losses
+                
+                # Add to recent trades (last 20)
+                stats["recent_trades"].append({
+                    "result": result,
+                    "profit_pct": profit_pct,
+                    "symbol": signal.get("symbol"),
+                    "time": signal.get("marked_at"),
+                })
+                if len(stats["recent_trades"]) > 20:
+                    stats["recent_trades"] = stats["recent_trades"][-20:]
+        
+        # Calculate metrics for each strategy
+        for strategy, stats in strategy_stats.items():
+            total = stats["total_trades"]
+            if total == 0:
+                continue
+            
+            stats["win_rate"] = round((stats["wins"] / total) * 100, 1)
+            stats["avg_profit_pct"] = round(stats["total_profit_pct"] / total, 2)
+            
+            # Average win/loss
+            if stats["wins"] > 0:
+                wins = [t["profit_pct"] for t in stats["recent_trades"] if t["result"] == "WIN"]
+                if wins:
+                    stats["avg_win_pct"] = round(sum(wins) / len(wins), 2)
+            
+            if stats["losses"] > 0:
+                losses = [t["profit_pct"] for t in stats["recent_trades"] if t["result"] == "LOSS"]
+                if losses:
+                    stats["avg_loss_pct"] = round(sum(losses) / len(losses), 2)
+            
+            # Expectancy
+            if stats["wins"] > 0 and stats["losses"] > 0:
+                win_rate_decimal = stats["wins"] / total
+                loss_rate_decimal = stats["losses"] / total
+                stats["expectancy"] = round(
+                    (win_rate_decimal * stats["avg_win_pct"]) + (loss_rate_decimal * stats["avg_loss_pct"]),
+                    2
+                )
+            
+            # Profit Factor (gross profit / gross loss)
+            if stats["losses"] > 0:
+                gross_profit = sum(t["profit_pct"] for t in stats["recent_trades"] if t["result"] == "WIN")
+                gross_loss = abs(sum(t["profit_pct"] for t in stats["recent_trades"] if t["result"] == "LOSS"))
+                if gross_loss > 0:
+                    stats["profit_factor"] = round(gross_profit / gross_loss, 2)
+            
+            # Strategy health status (from strategy_health_engine if available)
+            try:
+                health = strategy_health_engine.evaluate_strategy(strategy)
+                if health.status == "DISABLED":
+                    stats["status"] = "DISABLED"
+                    stats["status_reason"] = health.reason
+                elif health.status == "WARNING":
+                    stats["status"] = "WARNING"
+                    stats["status_reason"] = health.reason
+            except:
+                pass
+    
+        return jsonify({
+            "strategies": strategy_stats,
+            "overall": {
+                "total_trades": sum(s["total_trades"] for s in strategy_stats.values()),
+                "total_wins": sum(s["wins"] for s in strategy_stats.values()),
+                "total_losses": sum(s["losses"] for s in strategy_stats.values()),
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        print(f"⚠️ Strategy performance endpoint error: {e}")
+        return jsonify({
+            "error": str(e),
+            "strategies": {},
+            "overall": {"total_trades": 0, "total_wins": 0, "total_losses": 0},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+@app.route('/api/risk/exposure')
+def api_risk_exposure():
+    """
+    Risk exposure monitoring endpoint
+    Returns current risk metrics and exposure limits
+    """
+    try:
+        balance = get_available_balance()
+        capital = balance.get("total_usd", 0)
+        
+        # Calculate risk limits
+        daily_limit = capital * (DAILY_LOSS_LIMIT_PCT / 100) if capital > 0 else DAILY_LOSS_LIMIT_USD
+        weekly_limit = capital * (WEEKLY_LOSS_LIMIT_PCT / 100) if capital > 0 else DAILY_LOSS_LIMIT_USD * 2.5
+        
+        daily_pnl = auto_trading_state.get("daily_pnl", 0)
+        weekly_pnl = auto_trading_state.get("weekly_pnl", 0)
+        
+        # Current exposure (open positions)
+        total_exposure_usd = 0.0
+        total_risk_usd = 0.0
+        positions_risk = []
+        
+        for symbol, pos in open_positions.items():
+            if not pos:
+                continue
+            
+            asset_name = ASSET_NAMES.get(symbol, symbol)
+            entry_price = pos.get('entry_price', 0)
+            current_sl = pos.get('current_sl', pos.get('sl', 0))
+            direction = pos.get('direction', 'LONG')
+            size_usd = pos.get('size_usd', 0)
+            contracts = pos.get('size', 0)
+            
+            # Calculate risk (distance to SL)
+            if entry_price > 0 and current_sl > 0:
+                if direction == "LONG":
+                    sl_distance_pct = abs(entry_price - current_sl) / entry_price
+                    risk_usd = size_usd * sl_distance_pct
+                else:
+                    sl_distance_pct = abs(current_sl - entry_price) / entry_price
+                    risk_usd = size_usd * sl_distance_pct
+            else:
+                sl_distance_pct = 0
+                risk_usd = 0
+            
+            total_exposure_usd += size_usd
+            total_risk_usd += risk_usd
+            
+            positions_risk.append({
+                "symbol": symbol,
+                "asset": asset_name,
+                "direction": direction,
+                "exposure_usd": round(size_usd, 2),
+                "risk_usd": round(risk_usd, 2),
+                "sl_distance_pct": round(sl_distance_pct * 100, 2),
+                "leverage": pos.get('leverage', 1),
+            })
+        
+        # Risk metrics
+        exposure_pct = (total_exposure_usd / capital * 100) if capital > 0 else 0
+        risk_pct = (total_risk_usd / capital * 100) if capital > 0 else 0
+        
+        # Daily/Weekly limit usage
+        daily_limit_used_pct = (abs(daily_pnl) / daily_limit * 100) if daily_limit > 0 and daily_pnl < 0 else 0
+        weekly_limit_used_pct = (abs(weekly_pnl) / weekly_limit * 100) if weekly_limit > 0 and weekly_pnl < 0 else 0
+        
+        # Maximum Drawdown (v8.9.25)
+        current_equity = get_current_equity()
+        peak_equity = auto_trading_state.get("peak_equity", 0.0)
+        peak_equity_date = auto_trading_state.get("peak_equity_date")
+        
+        # Update peak if current equity is higher
+        update_peak_equity(current_equity)
+        peak_equity = auto_trading_state.get("peak_equity", current_equity)
+        
+        # Calculate drawdown
+        drawdown_usd = peak_equity - current_equity if peak_equity > 0 else 0.0
+        drawdown_pct = (drawdown_usd / peak_equity * 100) if peak_equity > 0 else 0.0
+        drawdown_limit_used_pct = (drawdown_pct / MAX_DRAWDOWN_PCT * 100) if MAX_DRAWDOWN_PCT > 0 else 0
+        
+        # Max positions check
+        current_positions = len([p for p in open_positions.values() if p])
+        max_positions = AUTO_TRADE_MAX_POSITIONS
+        
+        # Circuit breaker status
+        consecutive_losses = circuit_state.get("consecutive_losses", 0)
+        is_circuit_breaker_active = consecutive_losses >= MAX_CONSECUTIVE_LOSSES
+        
+        return jsonify({
+        "capital": {
+            "total_usd": round(capital, 2),
+            "cash_usd": round(balance.get("cash_usd", 0), 2),
+            "flex_usd": round(balance.get("flex_usd", 0), 2),
+        },
+        "exposure": {
+            "total_usd": round(total_exposure_usd, 2),
+            "total_pct": round(exposure_pct, 2),
+            "positions": positions_risk,
+            "count": len(positions_risk),
+        },
+        "risk": {
+            "total_risk_usd": round(total_risk_usd, 2),
+            "total_risk_pct": round(risk_pct, 2),
+            "max_risk_per_trade_usd": MAX_RISK_PER_TRADE_USD,
+            "avg_risk_per_position": round(total_risk_usd / len(positions_risk), 2) if positions_risk else 0,
+        },
+        "limits": {
+            "daily": {
+                "limit_pct": DAILY_LOSS_LIMIT_PCT,
+                "limit_usd": round(daily_limit, 2),
+                "current_pnl": round(daily_pnl, 2),
+                "used_pct": round(daily_limit_used_pct, 1),
+                "remaining_pct": round(100 - daily_limit_used_pct, 1),
+            },
+            "weekly": {
+                "limit_pct": WEEKLY_LOSS_LIMIT_PCT,
+                "limit_usd": round(weekly_limit, 2),
+                "current_pnl": round(weekly_pnl, 2),
+                "used_pct": round(weekly_limit_used_pct, 1),
+                "remaining_pct": round(100 - weekly_limit_used_pct, 1),
+            },
+            "drawdown": {
+                "limit_pct": MAX_DRAWDOWN_PCT,
+                "peak_equity_usd": round(peak_equity, 2),
+                "current_equity_usd": round(current_equity, 2),
+                "drawdown_usd": round(drawdown_usd, 2),
+                "drawdown_pct": round(drawdown_pct, 2),
+                "used_pct": round(drawdown_limit_used_pct, 1),
+                "remaining_pct": round(100 - drawdown_limit_used_pct, 1),
+                "peak_date": peak_equity_date,
+            },
+            "positions": {
+                "current": current_positions,
+                "max": max_positions,
+                "remaining": max_positions - current_positions,
+            },
+        },
+        "circuit_breaker": {
+            "active": is_circuit_breaker_active,
+            "consecutive_losses": consecutive_losses,
+            "max_losses": MAX_CONSECUTIVE_LOSSES,
+        },
+        "trading_status": {
+            "is_paused": auto_trading_state.get("is_paused", False),
+            "pause_reason": auto_trading_state.get("pause_reason"),
+            "pause_type": auto_trading_state.get("pause_type"),
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        print(f"⚠️ Risk exposure endpoint error: {e}")
+        return jsonify({
+            "error": str(e),
+            "capital": {"total_usd": 0, "cash_usd": 0, "flex_usd": 0},
+            "exposure": {"total_usd": 0, "total_pct": 0, "positions": [], "count": 0},
+            "risk": {"total_risk_usd": 0, "total_risk_pct": 0, "max_risk_per_trade_usd": 0, "avg_risk_per_position": 0},
+            "limits": {
+                "daily": {"limit_pct": 0, "limit_usd": 0, "current_pnl": 0, "used_pct": 0, "remaining_pct": 100},
+                "weekly": {"limit_pct": 0, "limit_usd": 0, "current_pnl": 0, "used_pct": 0, "remaining_pct": 100},
+                "drawdown": {"limit_pct": 0, "peak_equity_usd": 0, "current_equity_usd": 0, "drawdown_usd": 0, "drawdown_pct": 0, "used_pct": 0, "remaining_pct": 100, "peak_date": None},
+                "positions": {"current": 0, "max": 0, "remaining": 0},
+            },
+            "circuit_breaker": {"active": False, "consecutive_losses": 0, "max_losses": 0},
+            "trading_status": {"is_paused": False, "pause_reason": None, "pause_type": None},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
 @app.route('/api/bot/stop', methods=['POST'])
 def api_bot_stop():
     """Sustabdyti botą (pauzė)"""
@@ -7295,6 +11961,10 @@ def api_toggle_asset():
         "action": action,
         "disabled_assets": list(disabled_assets)
     })
+
+@app.route('/api/sunday/status')
+def api_sunday_status():
+    return jsonify(sunday_engine.get_sunday_status())
 
 @app.route('/emergency/close_all', methods=['POST', 'GET'])
 async def emergency_close_all():
@@ -7357,24 +12027,80 @@ Botas SUSTABDYTAS."""
 @app.route('/api/quant')
 def api_quant():
     global quant_results, quant_correlation, quant_last_update
+
+    if not QUANT_ENABLED:
+        return jsonify({
+            "enabled": False,
+            "message": "Quant analysis disabled"
+        })
     
     # v8.9.2: Faster quant refresh (15 minutes instead of 1 hour)
     QUANT_REFRESH_INTERVAL = 900  # 15 minutes
     need_refresh = (quant_last_update is None or 
                     (datetime.now() - quant_last_update).seconds > QUANT_REFRESH_INTERVAL)
+    if not quant_results:
+        cache = _load_quant_cache()
+        if cache and cache.get("assets"):
+            quant_results = cache.get("assets", {})
+            quant_correlation = cache.get("correlation")
+            cached_update = cache.get("last_update")
+            if cached_update and not quant_last_update:
+                try:
+                    quant_last_update = datetime.fromisoformat(cached_update)
+                except Exception:
+                    quant_last_update = None
+    need_refresh = (quant_last_update is None or 
+                    (datetime.now() - quant_last_update).seconds > QUANT_REFRESH_INTERVAL or
+                    not quant_results)
     
     if need_refresh:
         try:
             print("\n🧮 Paleidžiama matematinė analizė (4 metų duomenys)...")
-            quant_results, quant_correlation = quant_engine.run_all_assets()
-            quant_last_update = datetime.now()
+            new_results, new_correlation = run_quant_analysis_sync()
+            if new_results:
+                quant_results = new_results
+                quant_correlation = new_correlation
+                quant_last_update = datetime.now()
+                _save_quant_cache(quant_results, quant_correlation, quant_last_update)
+            else:
+                cached = _load_quant_cache()
+                if cached and cached.get("assets"):
+                    quant_results = cached.get("assets", {})
+                    quant_correlation = cached.get("correlation")
+                    cached_update = cached.get("last_update")
+                    if cached_update:
+                        try:
+                            quant_last_update = datetime.fromisoformat(cached_update)
+                        except Exception:
+                            quant_last_update = datetime.now()
             print("✅ Matematinė analizė baigta!")
         except Exception as e:
             print(f"Quant error: {e}")
             return jsonify({"error": str(e)}), 500
     
     summary = {}
-    for asset, data in quant_results.items():
+    cached = _load_quant_cache()
+    source_assets = quant_results
+    source_correlation = quant_correlation
+    source_last_update = quant_last_update
+    if cached and cached.get("assets"):
+        source_assets = cached.get("assets", {})
+        source_correlation = cached.get("correlation")
+        cached_update = cached.get("last_update")
+        if cached_update:
+            try:
+                source_last_update = datetime.fromisoformat(cached_update)
+            except Exception:
+                pass
+    if not source_assets:
+        cache_path = os.path.join(os.path.dirname(__file__), "quant_cache.json")
+        return jsonify({
+            "error": "Quant cache empty",
+            "cache_path": cache_path,
+            "last_update": source_last_update.isoformat() if source_last_update else None
+        }), 500
+
+    for asset, data in source_assets.items():
         if data:
             bias, signals = quant_engine.get_quant_signal_bias(data)
             mc7 = data.get('monte_carlo_7d', {})
@@ -7399,11 +12125,13 @@ def api_quant():
                 "fibonacci_bias": fib.get('bias', 'NEUTRAL'),
                 "annual_volatility": data.get('returns_analysis', {}).get('annual_volatility', 0),
             }
+    if not summary and source_assets:
+        print(f"⚠️ Quant API summary empty. Keys: {list(source_assets.keys())}")
     
     return jsonify({
         "assets": summary,
-        "correlation": quant_correlation,
-        "last_update": quant_last_update.isoformat() if quant_last_update else None,
+        "correlation": source_correlation,
+        "last_update": source_last_update.isoformat() if source_last_update else None,
     })
 
 @app.route('/api/sentiment')
@@ -7414,6 +12142,11 @@ def api_sentiment():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/bear_status')
+def bear_status():
+    summary = bear_engine.get_filter_summary() if bear_engine else {"market_mode": "UNKNOWN"}
+    return jsonify(summary)
 
 @app.route('/api/onchain')
 def api_onchain():
@@ -7473,6 +12206,40 @@ def api_test_signal():
         return jsonify({"success": True, "message": "Test signal sent to Telegram"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/market-intel')
+def api_market_intel():
+    """Market intel snapshot (structure analytics)."""
+    global market_intel_results, market_intel_last_update
+    if not market_intel_results:
+        cached = _load_market_intel_cache()
+        if cached and cached.get("assets"):
+            market_intel_results = cached.get("assets", {})
+            cached_update = cached.get("last_update")
+            if cached_update:
+                try:
+                    market_intel_last_update = datetime.fromisoformat(cached_update)
+                    if market_intel_last_update.tzinfo is None:
+                        market_intel_last_update = market_intel_last_update.replace(tzinfo=timezone.utc)
+                except Exception:
+                    market_intel_last_update = None
+    return jsonify({
+        "assets": market_intel_results,
+        "last_update": market_intel_last_update.isoformat() if market_intel_last_update else None
+    })
+
+@app.route('/api/telegram-status')
+def api_telegram_status():
+    """Check last Telegram send status (masked)."""
+    return jsonify({
+        "configured": bool(TELEGRAM_TOKEN and CHAT_ID),
+        "chat_id_masked": telegram_stats.get("last_chat_id_masked") or mask_chat_id(CHAT_ID),
+        "last_send": telegram_stats.get("last_send"),
+        "last_method": telegram_stats.get("last_method"),
+        "last_message_id": telegram_stats.get("last_message_id"),
+        "last_error": telegram_stats.get("last_error"),
+        "last_error_type": telegram_stats.get("last_error_type"),
+    })
 
 # ================================
 # WIN/LOSS TRACKING API
@@ -8302,13 +13069,109 @@ QUANT_HTML = """
 def run_flask():
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
+async def startup_health_check():
+    """Run startup health checks before auto-trading."""
+    if not AUTO_TRADING_ENABLED:
+        return True
+    
+    issues = []
+    
+    if not POSITION_TRACKING_ENABLED:
+        issues.append("POSITION_TRACKING_DISABLED")
+    
+    balance = fetch_multi_collateral_balance()
+    if balance.get("fetch_failed"):
+        issues.append("BALANCE_FETCH_FAILED")
+    if balance.get("total_usd", 0) <= 0:
+        issues.append("BALANCE_ZERO_OR_UNKNOWN")
+    
+    kraken_positions['last_fetch'] = None
+    await fetch_kraken_positions()
+    if kraken_positions.get("fetch_failed") and kraken_positions.get("consecutive_failures", 0) >= 2:
+        issues.append("POSITION_FETCH_FAILED")
+    
+    if issues:
+        auto_trading_state['is_paused'] = True
+        auto_trading_state['pause_type'] = "EMERGENCY"
+        auto_trading_state['pause_reason'] = "STARTUP_HEALTH_CHECK_FAILED"
+        log_risk_event("STARTUP_HEALTH_FAIL", f"Issues: {', '.join(issues)}", "critical")
+        await send_telegram_critical_alert("STARTUP_HEALTH_FAIL", f"Issues: {', '.join(issues)}")
+        return False
+    
+    eur_usd_rate = get_eur_usd_rate()
+    margin_usd_cap = min(AUTO_TRADE_MARGIN_USD, MAX_MARGIN_USD, MAX_MARGIN_EUR * eur_usd_rate)
+    daily_limit_pct = DAILY_LOSS_LIMIT_PCT
+    
+    await send_telegram_status(
+        "✅ <b>AUTO-TRADING ACTIVE</b>\n\n"
+        f"Margin cap: ${margin_usd_cap:.2f}\n"
+        f"Max leverage: {MAX_LEVERAGE}x\n"
+        f"Daily loss limit: {daily_limit_pct:.2f}%"
+    )
+    return True
+
 # ================================
 # MAIN
 # ================================
 def main():
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    if not acquire_single_instance_lock():
+        print("🟠 Another bot instance is already running. Exiting.")
+        raise SystemExit("Another bot instance is already running")
+    sanitize_proxy_env()
+    # Validate API keys at startup (if auto-trading enabled)
+    try:
+        validate_api_keys()
+        print("✅ API keys validated successfully")
+    except ValueError as e:
+        # Log critical error and exit
+        log_risk_event(
+            event_type="API_KEY_ERROR",
+            details=str(e),
+            severity="critical"
+        )
+        print(f"❌ FATAL: {e}")
+        print("🔴 Bot stopped: API keys invalid or missing")
+        raise SystemExit("Bot stopped: API keys invalid")
+    except Exception as e:
+        # Unexpected error during validation
+        log_risk_event(
+            event_type="API_KEY_VALIDATION_ERROR",
+            details=f"Unexpected error: {str(e)}",
+            severity="critical"
+        )
+        print(f"❌ FATAL: API key validation failed: {e}")
+        raise SystemExit("Bot stopped: API key validation failed")
     
+    # Start Flask web server in background (optional)
+    if ENABLE_HTTP_SERVER:
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+
+    global xgb_engine
+    if XGBOOST_AVAILABLE and XGBoostTradingEngine:
+        try:
+            xgb_engine = XGBoostTradingEngine()
+        except Exception as e:
+            print(f"⚠️ XGBoost init failed: {e}")
+            xgb_engine = None
+    else:
+        if XGBOOST_IMPORT_ERROR:
+            print(f"⚠️ XGBoost module unavailable: {XGBOOST_IMPORT_ERROR}")
+    
+    # Startup health checks (auto-trading safety)
+    if AUTO_TRADING_ENABLED:
+        ok = asyncio.run(startup_health_check())
+        if not ok:
+            print("🔴 Bot stopped: startup health check failed")
+            raise SystemExit("Bot stopped: startup health check failed")
+    else:
+        asyncio.run(send_telegram_status(
+            "<b>SIGNAL-ONLY MODE</b>\n\n"
+            "Auto-trading is disabled.\n"
+            "Bot will send signals only."
+        ))
+    
+    # Start main signal loop
     asyncio.run(signal_loop())
 
 if __name__ == "__main__":

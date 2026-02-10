@@ -76,11 +76,11 @@ class QuantAnalytics:
     def monte_carlo_simulation(self, prices: pd.Series, n_simulations: int = 1000, days: int = 5) -> Dict:
         """Monte Carlo simulation for price prediction"""
         if len(prices) < 20:
-            return {'bias': 0, 'confidence': 0}
+            return {'bias': 0, 'confidence': 0, 'prob_up': 0.5, 'prob_down': 0.5, 'expected_price': 0, 'current_price': 0, 'prob_up_10%': 0, 'prob_down_10%': 0}
         
         returns = prices.pct_change().dropna()
         if len(returns) < 10:
-            return {'bias': 0, 'confidence': 0}
+            return {'bias': 0, 'confidence': 0, 'prob_up': 0.5, 'prob_down': 0.5, 'expected_price': 0, 'current_price': 0, 'prob_up_10%': 0, 'prob_down_10%': 0}
         
         mean_return = returns.mean()
         std_return = returns.std()
@@ -99,11 +99,26 @@ class QuantAnalytics:
         bias_pct = ((avg_future - current_price) / current_price) * 100
         confidence = min(1.0, abs(bias_pct) / 5.0)
         
+        # Probabilities for up/down and +/-10% moves
+        up_count = sum(1 for p in simulations if p > current_price)
+        down_count = sum(1 for p in simulations if p < current_price)
+        prob_up = up_count / len(simulations) if simulations else 0.5
+        prob_down = down_count / len(simulations) if simulations else 0.5
+        
+        up_10 = current_price * 1.10
+        down_10 = current_price * 0.90
+        prob_up_10 = sum(1 for p in simulations if p >= up_10) / len(simulations) if simulations else 0
+        prob_down_10 = sum(1 for p in simulations if p <= down_10) / len(simulations) if simulations else 0
+        
         return {
             'bias': bias_pct,
             'confidence': confidence,
             'expected_price': avg_future,
-            'current_price': current_price
+            'current_price': current_price,
+            'prob_up': prob_up,
+            'prob_down': prob_down,
+            'prob_up_10%': prob_up_10,
+            'prob_down_10%': prob_down_10
         }
     
     def arima_forecast(self, prices: pd.Series, periods: int = 5) -> Dict:

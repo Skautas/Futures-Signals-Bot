@@ -4,7 +4,7 @@ Profesionalus crypto futures signalų botas su automatiniu prekybos valdymu.
 
 ## 🚀 Funkcijos
 
-- **Automatinis signalų generavimas** - 7 crypto assetai (BTC, ETH, SOL, XRP, LTC, ADA, DOT)
+- **Automatinis signalų generavimas** - 8 crypto assetai (BTC, ETH, SOL, XRP, LTC, ADA, DOT, LINK)
 - **Automatinių pozicijų valdymas** - Kraken Futures integracija
 - **Trailing Stop Loss** - Automatinis stop loss atnaujinimas
 - **Dynamic Leverage** - Automatinis leverage pasirinkimas pagal signalo stiprumą

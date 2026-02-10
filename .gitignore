@@ -28,8 +28,12 @@ wheels/
 
 # Data files
 signal_results.json
+bot_state.json
 *.db
 *.sqlite
+
+# Watchdog lock file
+bot/bot.lock
 
 # IDE
 .vscode/

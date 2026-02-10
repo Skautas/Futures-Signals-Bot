@@ -27,3 +27,11 @@ scipy>=1.11.0
 # Optional: For HTTP requests (if not using urllib)
 requests>=2.31.0
 
+# Load .env config
+python-dotenv>=1.0.1
+
+# ML enhancements
+xgboost
+imbalanced-learn
+joblib
+

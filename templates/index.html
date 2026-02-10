@@ -4,10 +4,535 @@
     <title>Futures Signal Bot</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background: #0a0a0f; color: #fff; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .header h1 { color: #00d4aa; font-size: 2em; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #1a1a2e; padding: 20px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 2em; font-weight: bold; color: #00d4aa; }
+        .stat-label { color: #888; margin-top: 5px; }
+        .signals { background: #1a1a2e; border-radius: 10px; padding: 20px; }
+        .signals h2 { color: #00d4aa; margin-bottom: 15px; }
+        .signal { background: #252540; padding: 15px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        .signal-long { border-left: 4px solid #00ff88; }
+        .signal-short { border-left: 4px solid #ff4466; }
+        .signal-info { flex: 1; }
+        .signal-asset { font-weight: bold; font-size: 1.2em; }
+        .signal-direction { padding: 5px 10px; border-radius: 5px; font-weight: bold; }
+        .long { background: #00ff8820; color: #00ff88; }
+        .short { background: #ff446620; color: #ff4466; }
+        .signal-details { color: #888; font-size: 0.9em; margin-top: 5px; }
+        .no-signals { text-align: center; color: #666; padding: 40px; }
+        
+        .positions-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 30px; }
+        @media (max-width: 1200px) { .positions-grid { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 600px) { .positions-grid { grid-template-columns: 1fr; } }
+        
+        .position-card { background: #1a1a2e; border-radius: 12px; padding: 20px; position: relative; }
+        .position-active { border: 2px solid #00d4aa; }
+        .position-inactive { border: 2px solid #333; opacity: 0.7; }
+        .position-long { border-color: #00ff88; }
+        .position-short { border-color: #ff4466; }
+        
+        .position-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .position-asset { font-size: 1.5em; font-weight: bold; color: #fff; }
+        .position-direction { padding: 5px 12px; border-radius: 5px; font-weight: bold; font-size: 0.9em; }
+        .position-inactive-badge { padding: 5px 12px; border-radius: 5px; background: #333; color: #666; font-size: 0.8em; }
+        
+        .position-price { font-size: 1.8em; font-weight: bold; color: #fff; margin: 10px 0; }
+        .position-pnl { font-size: 1.4em; font-weight: bold; margin-bottom: 15px; }
+        .pnl-positive { color: #00ff88; }
+        .pnl-negative { color: #ff4466; }
+        
+        .position-levels { border-top: 1px solid #333; padding-top: 15px; }
+        .level-row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; }
+        .level-label { color: #888; font-size: 0.9em; }
+        .level-value { color: #fff; font-weight: 500; }
+        .sl-value { color: #ff4466; }
+        .tp-hit { color: #00ff88; text-decoration: line-through; }
+        
+        .trailing-badge { background: #ffd700; color: #000; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px; }
+        .be-badge { background: #00d4aa; color: #000; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px; }
+        .tp-badge { background: #00ff88; color: #000; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px; }
+        
+        .position-waiting { color: #666; text-align: center; padding: 30px 0; font-style: italic; }
+        
+        .nav-links { text-align: center; margin-bottom: 20px; }
+        .nav-links a { display: inline-block; padding: 10px 20px; margin: 5px; background: #1a1a2e; color: #00d4aa; text-decoration: none; border-radius: 20px; font-weight: bold; }
+        .nav-links a:hover { background: #252540; }
+        
+        /* Monitoring Dashboard Styles */
+        .monitoring-section { background: #1a1a2e; border-radius: 10px; padding: 20px; margin-bottom: 30px; }
+        .monitoring-section h2 { color: #00d4aa; margin-bottom: 20px; font-size: 1.3em; }
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+        .metric-card { background: #252540; padding: 15px; border-radius: 8px; border-left: 3px solid #00d4aa; }
+        .metric-label { color: #888; font-size: 0.85em; margin-bottom: 5px; }
+        .metric-value { color: #fff; font-size: 1.5em; font-weight: bold; }
+        .metric-value.positive { color: #00ff88; }
+        .metric-value.negative { color: #ff4466; }
+        .metric-value.warning { color: #ffd700; }
+        
+        .strategy-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .strategy-table th { background: #252540; padding: 12px; text-align: left; color: #00d4aa; font-size: 0.9em; }
+        .strategy-table td { padding: 10px 12px; border-bottom: 1px solid #333; font-size: 0.9em; }
+        .strategy-table tr:hover { background: #252540; }
+        .status-badge { padding: 4px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold; }
+        .status-active { background: #00ff8820; color: #00ff88; }
+        .status-warning { background: #ffd70020; color: #ffd700; }
+        .status-disabled { background: #ff446620; color: #ff4466; }
+        
+        .risk-bar { background: #333; height: 20px; border-radius: 10px; overflow: hidden; margin: 5px 0; }
+        .risk-bar-fill { height: 100%; transition: width 0.3s ease; }
+        .risk-bar-safe { background: #00ff88; }
+        .risk-bar-warning { background: #ffd700; }
+        .risk-bar-danger { background: #ff4466; }
+        
+        .refresh-btn { background: #00d4aa; color: #000; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; font-weight: bold; margin-bottom: 15px; }
+        .refresh-btn:hover { background: #00b894; }
+
+        .profit-widgets { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .profit-widget { background: #1a1a2e; border-radius: 10px; padding: 15px; }
+        .profit-widget h4 { color: #00d4aa; margin-bottom: 10px; font-size: 1.05em; }
+        .profit-widget progress { width: 100%; height: 16px; margin: 8px 0; }
+        .profit-widget .value { color: #fff; font-weight: bold; }
+        .profit-widget .muted { color: #888; font-size: 0.9em; }
+    </style>
 </head>
 <body>
-    <h1>Futures Signal Bot Dashboard</h1>
-    <p>Dashboard will be loaded here</p>
+    <div class="header">
+        <h1>🚀 Futures Signal Bot</h1>
+        <p>BTC | ETH | SOL | XRP Perpetuals</p>
+        <div class="nav-links">
+            <a href="/quant">🧮 Matematinė Analizė</a>
+            <a href="/advanced">🤖 AI + On-Chain</a>
+        </div>
+    </div>
+    
+    <div class="stats" id="stats">
+        <div class="stat-card">
+            <div class="stat-value" id="total-signals">0</div>
+            <div class="stat-label">Total Signals</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: #00ff88;" id="long-signals">0</div>
+            <div class="stat-label">LONG Signals</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color: #ff4466;" id="short-signals">0</div>
+            <div class="stat-label">SHORT Signals</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="uptime">-</div>
+            <div class="stat-label">Uptime</div>
+        </div>
+    </div>
+
+    <div class="profit-widgets">
+        <div class="profit-widget real-time-profit">
+            <h4>📊 Live Performance</h4>
+            <div>Today: <span class="value" id="todayProfit">0.00€</span></div>
+            <div>Target: <span class="value" id="dailyTarget">10.00€</span></div>
+            <div>Progress: <progress id="profitProgress" value="0" max="100"></progress></div>
+            <div class="muted">Time until reset: <span id="timeReset">23:45</span></div>
+        </div>
+
+        <div class="profit-widget top-assets">
+            <h4>🏆 Top Assets</h4>
+            <div id="assetRanking" class="muted">Loading...</div>
+        </div>
+
+        <div class="profit-widget trade-stats">
+            <h4>📈 Today's Stats</h4>
+            <div>Trades: <span class="value" id="tradeCount">0</span></div>
+            <div>Win Rate: <span class="value" id="winRate">0%</span></div>
+            <div>Avg Profit: <span class="value" id="avgProfit">0.00€</span></div>
+        </div>
+    </div>
+    
+    <h2 style="color: #00d4aa; margin-bottom: 15px;">📍 Open Positions (Trailing Stop)</h2>
+    <div class="positions-grid" id="positions">
+        <div class="position-waiting">Loading positions...</div>
+    </div>
+    
+    <!-- Real-time P&L Tracking Section -->
+    <div class="monitoring-section">
+        <h2>💰 Real-time P&L Tracking</h2>
+        <button class="refresh-btn" onclick="updatePnlTracking()">🔄 Refresh</button>
+        <div id="pnl-tracking" class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Total P&L (USD)</div>
+                <div class="metric-value" id="total-pnl-usd">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Total P&L (%)</div>
+                <div class="metric-value" id="total-pnl-pct">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Unrealized P&L</div>
+                <div class="metric-value" id="unrealized-pnl">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Realized P&L (Daily)</div>
+                <div class="metric-value" id="realized-daily">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Realized P&L (Weekly)</div>
+                <div class="metric-value" id="realized-weekly">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Capital</div>
+                <div class="metric-value" id="capital">-</div>
+            </div>
+        </div>
+        <div id="pnl-positions" style="margin-top: 15px;"></div>
+    </div>
+    
+    <!-- Strategy Performance Metrics Section -->
+    <div class="monitoring-section">
+        <h2>📈 Strategy Performance Metrics</h2>
+        <button class="refresh-btn" onclick="updateStrategyPerformance()">🔄 Refresh</button>
+        <div id="strategy-performance">
+            <table class="strategy-table">
+                <thead>
+                    <tr>
+                        <th>Strategy</th>
+                        <th>Status</th>
+                        <th>Total Trades</th>
+                        <th>Win Rate</th>
+                        <th>Wins</th>
+                        <th>Losses</th>
+                        <th>Total Profit %</th>
+                        <th>Avg Profit %</th>
+                        <th>Expectancy</th>
+                        <th>Profit Factor</th>
+                    </tr>
+                </thead>
+                <tbody id="strategy-tbody">
+                    <tr><td colspan="10" style="text-align: center; color: #666;">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <!-- Risk Exposure Monitoring Section -->
+    <div class="monitoring-section">
+        <h2>🛡️ Risk Exposure Monitoring</h2>
+        <button class="refresh-btn" onclick="updateRiskExposure()">🔄 Refresh</button>
+        <div id="risk-exposure" class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Total Exposure (USD)</div>
+                <div class="metric-value" id="total-exposure">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Total Risk (USD)</div>
+                <div class="metric-value" id="total-risk">-</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Daily Limit Used</div>
+                <div class="metric-value" id="daily-limit-used">-</div>
+                <div class="risk-bar"><div class="risk-bar-fill" id="daily-limit-bar"></div></div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Weekly Limit Used</div>
+                <div class="metric-value" id="weekly-limit-used">-</div>
+                <div class="risk-bar"><div class="risk-bar-fill" id="weekly-limit-bar"></div></div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Open Positions</div>
+                <div class="metric-value" id="open-positions-count">-</div>
+                <div style="color: #888; font-size: 0.8em; margin-top: 5px;">Max: 3</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Circuit Breaker</div>
+                <div class="metric-value" id="circuit-breaker">-</div>
+            </div>
+        </div>
+        <div id="risk-positions" style="margin-top: 15px;"></div>
+    </div>
+    
+    <div class="signals" style="margin-top: 30px;">
+        <h2>📊 Recent Signals</h2>
+        <div id="signals-container">
+            <div class="no-signals">Loading signals...</div>
+        </div>
+    </div>
+    
+    <script>
+        async function updateDashboard() {
+            try {
+                const [statsRes, signalsRes, positionsRes] = await Promise.all([
+                    fetch('/api/stats'),
+                    fetch('/api/signals'),
+                    fetch('/api/positions')
+                ]);
+                
+                const stats = await statsRes.json();
+                const signals = await signalsRes.json();
+                const positions = positionsRes.ok ? await positionsRes.json() : [];
+                
+                // Update stats
+                document.getElementById('total-signals').textContent = stats.total_signals || 0;
+                document.getElementById('long-signals').textContent = stats.long_signals || 0;
+                document.getElementById('short-signals').textContent = stats.short_signals || 0;
+                
+                // Calculate uptime
+                if (stats.start_time) {
+                    const start = new Date(stats.start_time);
+                    const now = new Date();
+                    const diff = now - start;
+                    const hours = Math.floor(diff / 3600000);
+                    const minutes = Math.floor((diff % 3600000) / 60000);
+                    document.getElementById('uptime').textContent = `${hours}h ${minutes}m`;
+                }
+                
+                // Update positions
+                const positionsContainer = document.getElementById('positions');
+                if (positions && positions.length > 0) {
+                    let positionsHtml = '';
+                    positions.forEach(pos => {
+                        const dir = pos.direction.toLowerCase();
+                        const pnlClass = pos.pnl_pct >= 0 ? 'pnl-positive' : 'pnl-negative';
+                        positionsHtml += `
+                            <div class="position-card position-active position-${dir}">
+                                <div class="position-header">
+                                    <span class="position-asset">${pos.asset}</span>
+                                    <span class="position-direction ${dir}">${pos.direction}</span>
+                                </div>
+                                <div class="position-price">$${pos.current_price.toFixed(2)}</div>
+                                <div class="position-pnl ${pnlClass}">${pos.pnl_pct >= 0 ? '+' : ''}${pos.pnl_pct.toFixed(2)}%</div>
+                                <div class="position-levels">
+                                    <div class="level-row">
+                                        <span class="level-label">Entry:</span>
+                                        <span class="level-value">$${pos.entry.toFixed(2)}</span>
+                                    </div>
+                                    <div class="level-row">
+                                        <span class="level-label">SL:</span>
+                                        <span class="level-value sl-value">$${pos.sl.toFixed(2)}</span>
+                                        ${pos.trailing_active ? '<span class="trailing-badge">TRAILING</span>' : ''}
+                                        ${pos.breakeven_active ? '<span class="be-badge">BE</span>' : ''}
+                                    </div>
+                                    <div class="level-row">
+                                        <span class="level-label">TP1:</span>
+                                        <span class="level-value ${pos.tp1_hit ? 'tp-hit' : ''}">$${pos.tp1.toFixed(2)}</span>
+                                        ${pos.tp1_hit ? '<span class="tp-badge">HIT</span>' : ''}
+                                    </div>
+                                    <div class="level-row">
+                                        <span class="level-label">TP2:</span>
+                                        <span class="level-value ${pos.tp2_hit ? 'tp-hit' : ''}">$${pos.tp2.toFixed(2)}</span>
+                                        ${pos.tp2_hit ? '<span class="tp-badge">HIT</span>' : ''}
+                                    </div>
+                                    <div class="level-row">
+                                        <span class="level-label">TP3:</span>
+                                        <span class="level-value">$${pos.tp3.toFixed(2)}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    positionsContainer.innerHTML = positionsHtml;
+                } else {
+                    positionsContainer.innerHTML = '<div class="position-waiting">No open positions</div>';
+                }
+                
+                // Update signals
+                const signalsContainer = document.getElementById('signals-container');
+                if (signals && signals.length > 0) {
+                    let signalsHtml = '';
+                    signals.forEach(s => {
+                        const dir = s.direction.toLowerCase();
+                        signalsHtml += `
+                            <div class="signal signal-${dir}">
+                                <div class="signal-info">
+                                    <span class="signal-asset">${s.asset}</span>
+                                    <span class="signal-direction ${dir}">${s.direction}</span>
+                                    <div class="signal-details">
+                                        Entry: $${s.price.toFixed(2)} | SL: $${s.sl.toFixed(2)} | TP1: $${s.tp1.toFixed(2)}
+                                    </div>
+                                    <div class="signal-details">
+                                        Score: ${s.score} | Trend: ${s.trend} | ${s.time}
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    signalsContainer.innerHTML = signalsHtml;
+                } else {
+                    signalsContainer.innerHTML = '<div class="no-signals"><p>No signals yet. Monitoring markets...</p></div>';
+                }
+            } catch(e) { 
+                console.error('Update error:', e);
+                document.getElementById('signals-container').innerHTML = '<div class="no-signals"><p>Error loading data. Please refresh.</p></div>';
+            }
+        }
+
+        async function updateProfitWidgets() {
+            try {
+                const [profitRes, assetsRes] = await Promise.all([
+                    fetch('/api/profit'),
+                    fetch('/api/assets/top')
+                ]);
+
+                const profit = await profitRes.json();
+                const assets = await assetsRes.json();
+
+                document.getElementById('todayProfit').textContent = `${profit.daily_profit.toFixed(2)}€`;
+                document.getElementById('dailyTarget').textContent = `${profit.daily_target.toFixed(2)}€`;
+                document.getElementById('timeReset').textContent = profit.time_until_reset;
+
+                const progress = profit.daily_target > 0 ? Math.min(100, (profit.daily_profit / profit.daily_target) * 100) : 0;
+                document.getElementById('profitProgress').value = progress;
+
+                document.getElementById('tradeCount').textContent = profit.daily_trades;
+                document.getElementById('winRate').textContent = `${profit.win_rate.toFixed(1)}%`;
+                document.getElementById('avgProfit').textContent = `${profit.avg_profit.toFixed(2)}€`;
+
+                if (assets.assets && assets.assets.length > 0) {
+                    const rows = assets.assets.map(a => `
+                        <div>${a.asset}: <span class="value">${a.win_rate.toFixed(1)}%</span> | ${a.avg_profit.toFixed(2)}€</div>
+                    `);
+                    document.getElementById('assetRanking').innerHTML = rows.join('');
+                } else {
+                    document.getElementById('assetRanking').textContent = 'No data yet';
+                }
+            } catch (e) {
+                console.error('Profit widgets error:', e);
+            }
+        }
+        
+        // Real-time P&L Tracking
+        async function updatePnlTracking() {
+            try {
+                const res = await fetch('/api/pnl/realtime');
+                const data = await res.json();
+                
+                const totalPnlUsd = data.total.pnl_usd || 0;
+                const totalPnlPct = data.total.pnl_pct || 0;
+                
+                document.getElementById('total-pnl-usd').textContent = `$${totalPnlUsd.toFixed(2)}`;
+                document.getElementById('total-pnl-usd').className = `metric-value ${totalPnlUsd >= 0 ? 'positive' : 'negative'}`;
+                
+                document.getElementById('total-pnl-pct').textContent = `${totalPnlPct >= 0 ? '+' : ''}${totalPnlPct.toFixed(2)}%`;
+                document.getElementById('total-pnl-pct').className = `metric-value ${totalPnlPct >= 0 ? 'positive' : 'negative'}`;
+                
+                document.getElementById('unrealized-pnl').textContent = `$${data.unrealized.total_usd.toFixed(2)}`;
+                document.getElementById('unrealized-pnl').className = `metric-value ${data.unrealized.total_usd >= 0 ? 'positive' : 'negative'}`;
+                
+                document.getElementById('realized-daily').textContent = `$${data.realized.daily_usd.toFixed(2)}`;
+                document.getElementById('realized-daily').className = `metric-value ${data.realized.daily_usd >= 0 ? 'positive' : 'negative'}`;
+                
+                document.getElementById('realized-weekly').textContent = `$${data.realized.weekly_usd.toFixed(2)}`;
+                document.getElementById('realized-weekly').className = `metric-value ${data.realized.weekly_usd >= 0 ? 'positive' : 'negative'}`;
+                
+                document.getElementById('capital').textContent = `$${data.total.capital.toFixed(2)}`;
+                
+                // Positions P&L breakdown
+                const positionsHtml = data.unrealized.positions.map(pos => `
+                    <div style="background: #252540; padding: 10px; border-radius: 5px; margin: 5px 0;">
+                        <strong>${pos.asset}</strong> ${pos.direction} | 
+                        P&L: <span style="color: ${pos.pnl_usd >= 0 ? '#00ff88' : '#ff4466'}">
+                            $${pos.pnl_usd.toFixed(2)} (${pos.pnl_pct >= 0 ? '+' : ''}${pos.pnl_pct.toFixed(2)}%)
+                        </span>
+                    </div>
+                `).join('');
+                document.getElementById('pnl-positions').innerHTML = positionsHtml || '<div style="color: #666; text-align: center;">No open positions</div>';
+            } catch(e) {
+                console.error('P&L tracking error:', e);
+            }
+        }
+        
+        // Strategy Performance Metrics
+        async function updateStrategyPerformance() {
+            try {
+                const res = await fetch('/api/strategy/performance');
+                const data = await res.json();
+                
+                let tbodyHtml = '';
+                for (const [strategy, stats] of Object.entries(data.strategies)) {
+                    const statusClass = stats.status === 'ACTIVE' ? 'status-active' : 
+                                       stats.status === 'WARNING' ? 'status-warning' : 'status-disabled';
+                    tbodyHtml += `
+                        <tr>
+                            <td><strong>${strategy}</strong></td>
+                            <td><span class="status-badge ${statusClass}">${stats.status}</span></td>
+                            <td>${stats.total_trades}</td>
+                            <td>${stats.win_rate.toFixed(1)}%</td>
+                            <td style="color: #00ff88;">${stats.wins}</td>
+                            <td style="color: #ff4466;">${stats.losses}</td>
+                            <td class="${stats.total_profit_pct >= 0 ? 'positive' : 'negative'}">${stats.total_profit_pct >= 0 ? '+' : ''}${stats.total_profit_pct.toFixed(2)}%</td>
+                            <td class="${stats.avg_profit_pct >= 0 ? 'positive' : 'negative'}">${stats.avg_profit_pct >= 0 ? '+' : ''}${stats.avg_profit_pct.toFixed(2)}%</td>
+                            <td class="${stats.expectancy >= 0 ? 'positive' : 'negative'}">${stats.expectancy >= 0 ? '+' : ''}${stats.expectancy.toFixed(2)}</td>
+                            <td>${stats.profit_factor > 0 ? stats.profit_factor.toFixed(2) : '-'}</td>
+                        </tr>
+                    `;
+                }
+                document.getElementById('strategy-tbody').innerHTML = tbodyHtml || '<tr><td colspan="10" style="text-align: center; color: #666;">No data available</td></tr>';
+            } catch(e) {
+                console.error('Strategy performance error:', e);
+            }
+        }
+        
+        // Risk Exposure Monitoring
+        async function updateRiskExposure() {
+            try {
+                const res = await fetch('/api/risk/exposure');
+                const data = await res.json();
+                
+                document.getElementById('total-exposure').textContent = `$${data.exposure.total_usd.toFixed(2)}`;
+                document.getElementById('total-risk').textContent = `$${data.risk.total_risk_usd.toFixed(2)}`;
+                
+                const dailyUsedPct = data.limits.daily.used_pct || 0;
+                document.getElementById('daily-limit-used').textContent = `${dailyUsedPct.toFixed(1)}%`;
+                document.getElementById('daily-limit-used').className = `metric-value ${dailyUsedPct < 50 ? 'positive' : dailyUsedPct < 80 ? 'warning' : 'negative'}`;
+                const dailyBar = document.getElementById('daily-limit-bar');
+                dailyBar.style.width = `${Math.min(dailyUsedPct, 100)}%`;
+                dailyBar.className = `risk-bar-fill ${dailyUsedPct < 50 ? 'risk-bar-safe' : dailyUsedPct < 80 ? 'risk-bar-warning' : 'risk-bar-danger'}`;
+                
+                const weeklyUsedPct = data.limits.weekly.used_pct || 0;
+                document.getElementById('weekly-limit-used').textContent = `${weeklyUsedPct.toFixed(1)}%`;
+                document.getElementById('weekly-limit-used').className = `metric-value ${weeklyUsedPct < 50 ? 'positive' : weeklyUsedPct < 80 ? 'warning' : 'negative'}`;
+                const weeklyBar = document.getElementById('weekly-limit-bar');
+                weeklyBar.style.width = `${Math.min(weeklyUsedPct, 100)}%`;
+                weeklyBar.className = `risk-bar-fill ${weeklyUsedPct < 50 ? 'risk-bar-safe' : weeklyUsedPct < 80 ? 'risk-bar-warning' : 'risk-bar-danger'}`;
+                
+                document.getElementById('open-positions-count').textContent = `${data.limits.positions.current}/${data.limits.positions.max}`;
+                document.getElementById('open-positions-count').className = `metric-value ${data.limits.positions.current < data.limits.positions.max ? 'positive' : 'warning'}`;
+                
+                const circuitBreaker = data.circuit_breaker.active ? 'ACTIVE' : `OK (${data.circuit_breaker.consecutive_losses}/${data.circuit_breaker.max_losses})`;
+                document.getElementById('circuit-breaker').textContent = circuitBreaker;
+                document.getElementById('circuit-breaker').className = `metric-value ${data.circuit_breaker.active ? 'negative' : 'positive'}`;
+                
+                // Risk positions breakdown
+                const riskPositionsHtml = data.exposure.positions.map(pos => `
+                    <div style="background: #252540; padding: 10px; border-radius: 5px; margin: 5px 0;">
+                        <strong>${pos.asset}</strong> ${pos.direction} | 
+                        Exposure: $${pos.exposure_usd.toFixed(2)} | 
+                        Risk: <span style="color: #ff4466;">$${pos.risk_usd.toFixed(2)}</span> 
+                        (${pos.sl_distance_pct.toFixed(2)}%)
+                    </div>
+                `).join('');
+                document.getElementById('risk-positions').innerHTML = riskPositionsHtml || '<div style="color: #666; text-align: center;">No open positions</div>';
+            } catch(e) {
+                console.error('Risk exposure error:', e);
+            }
+        }
+        
+        // Load immediately
+        updateDashboard();
+        updatePnlTracking();
+        updateStrategyPerformance();
+        updateRiskExposure();
+        updateProfitWidgets();
+        
+        // Update every 30 seconds
+        setInterval(() => {
+            updateDashboard();
+            updatePnlTracking();
+            updateStrategyPerformance();
+            updateRiskExposure();
+            updateProfitWidgets();
+        }, 30000);
+    </script>
 </body>
 </html>
-

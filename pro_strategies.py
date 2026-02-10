@@ -124,10 +124,106 @@ class MarketStructure:
         return {"bullish_choch": False, "bearish_choch": False}
 
 
+from dataclasses import dataclass
+
+
+@dataclass
+class OrderBlockZone:
+    direction: str  # "BULLISH" | "BEARISH"
+    top: float
+    bottom: float
+    index: int
+
+    def contains_price(self, price: float) -> bool:
+        return self.bottom <= price <= self.top
+
+
 class OrderBlocks:
     @staticmethod
     def is_price_at_key_zone(df: pd.DataFrame, direction: str, tolerance_pct: float) -> Dict:
-        return {"is_at_zone": False, "zone_type": None}
+        """
+        Lightweight Order Block detection.
+        Looks for last opposite candle before strong impulse move,
+        then checks if current price is within that candle's range.
+        """
+        try:
+            if df is None or len(df) < 30:
+                return {"is_at_zone": False, "zone_type": None}
+            if not all(c in df.columns for c in ["open", "high", "low", "close"]):
+                return {"is_at_zone": False, "zone_type": None}
+
+            lookback = 40
+            window = df.tail(lookback)
+            closes = window["close"]
+            ranges = (window["high"] - window["low"]).replace(0, pd.NA)
+            median_range = ranges.median()
+            if not pd.notna(median_range) or median_range == 0:
+                return {"is_at_zone": False, "zone_type": None}
+
+            # Identify impulse candles (range > 1.6x median)
+            impulse_mask = ranges > (median_range * 1.6)
+            if not impulse_mask.any():
+                return {"is_at_zone": False, "zone_type": None}
+
+            current_price = closes.iloc[-1]
+            # Search from most recent backwards
+            for idx in range(len(window) - 2, 1, -1):
+                if not impulse_mask.iloc[idx]:
+                    continue
+                impulse = window.iloc[idx]
+                prev = window.iloc[idx - 1]
+
+                # Determine impulse direction by candle body
+                impulse_bull = impulse["close"] > impulse["open"]
+                impulse_bear = impulse["close"] < impulse["open"]
+
+                if direction == "LONG" and impulse_bull and prev["close"] < prev["open"]:
+                    ob_high = prev["high"]
+                    ob_low = prev["low"]
+                    zone_type = "OB_BULL"
+                elif direction == "SHORT" and impulse_bear and prev["close"] > prev["open"]:
+                    ob_high = prev["high"]
+                    ob_low = prev["low"]
+                    zone_type = "OB_BEAR"
+                else:
+                    continue
+
+                # Check if current price is within OB range (+/- tolerance)
+                tol = (ob_high - ob_low) * (tolerance_pct / 100.0)
+                zone_high = ob_high + tol
+                zone_low = ob_low - tol
+                if zone_low <= current_price <= zone_high:
+                    return {"is_at_zone": True, "zone_type": zone_type}
+
+            return {"is_at_zone": False, "zone_type": None}
+        except Exception:
+            return {"is_at_zone": False, "zone_type": None}
+
+    @staticmethod
+    def classify_zone(ob: OrderBlockZone):
+        if ob.direction == "BEARISH":
+            return "SUPPLY"
+        if ob.direction == "BULLISH":
+            return "DEMAND"
+        return None
+
+    @staticmethod
+    def detect_htf_order_blocks(df: pd.DataFrame, atr: float, impulse_mult: float = 1.5):
+        zones = []
+        if df is None or len(df) < 5 or atr is None:
+            return zones
+        candles = df[["open", "high", "low", "close"]].to_dict("records")
+        for i in range(len(candles) - 3):
+            c = candles[i]
+            if c["close"] < c["open"]:
+                impulse = candles[i + 1]["high"] - candles[i]["low"]
+                if impulse > impulse_mult * atr:
+                    zones.append(OrderBlockZone("BULLISH", c["open"], c["low"], i))
+            if c["close"] > c["open"]:
+                impulse = candles[i]["high"] - candles[i + 1]["low"]
+                if impulse > impulse_mult * atr:
+                    zones.append(OrderBlockZone("BEARISH", c["high"], c["open"], i))
+        return zones
 
 
 class FairValueGap:

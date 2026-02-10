@@ -16,6 +16,12 @@ class SentimentAnalyzer:
         self.fear_greed_cache = None
         self.fear_greed_cache_time = None
         self.cache_duration = 3600  # 1 hour cache
+
+    def _safe_get(self, url: str, headers: Dict[str, str] = None, timeout: int = 5):
+        """Requests helper that ignores system/environment proxies."""
+        session = requests.Session()
+        session.trust_env = False
+        return session.get(url, headers=headers, timeout=timeout)
     
     def get_reddit_sentiment(self, asset_name: str) -> Dict:
         """Get Reddit sentiment for asset"""
@@ -37,7 +43,7 @@ class SentimentAnalyzer:
             try:
                 url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=25"
                 headers = {'User-Agent': 'TradingBot/1.0'}
-                response = requests.get(url, headers=headers, timeout=5)
+                response = self._safe_get(url, headers=headers, timeout=5)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -119,7 +125,7 @@ class SentimentAnalyzer:
             # Try to fetch from alternative-c.me API (public endpoint)
             try:
                 url = "https://api.alternative.me/fng/"
-                response = requests.get(url, timeout=5)
+                response = self._safe_get(url, timeout=5)
                 
                 if response.status_code == 200:
                     data = response.json()

@@ -95,7 +95,7 @@ class OnChainAnalytics:
     
     def get_all_analytics(self) -> Dict:
         """Get on-chain analytics for all assets"""
-        assets = ['BTC', 'ETH', 'SOL', 'XRP', 'LTC', 'ADA', 'DOT']
+        assets = ['BTC', 'ETH', 'SOL', 'XRP', 'LTC', 'ADA', 'DOT', 'LINK']
         results = {}
         
         for asset in assets:
