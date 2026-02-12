@@ -6,6 +6,11 @@ from bot.regime_filters import regime_flip_block
 from bot.expansion_filter import expansion_bias_block
 from zone_gate import zone_gate_decision
 
+try:
+    from config import RANGE_ALLOW_OUTSIDE_ZONE
+except ImportError:
+    RANGE_ALLOW_OUTSIDE_ZONE = False
+
 
 def direction_gate(market_state):
     allow_long = False
@@ -71,49 +76,59 @@ def evaluate_signal(
         allow_long, allow_short = direction_gate(market_state)
 
     if signal_direction == "LONG" and not allow_long:
-        return False, "BLOCKED: MARKET_STATE_LONG_DISABLED", size_mult, conf_mult
+        return False, "BLOCKED: MARKET_STATE_LONG_DISABLED", size_mult, conf_mult, 1.0
 
     if signal_direction == "SHORT" and not allow_short:
-        return False, "BLOCKED: MARKET_STATE_SHORT_DISABLED", size_mult, conf_mult
+        return False, "BLOCKED: MARKET_STATE_SHORT_DISABLED", size_mult, conf_mult, 1.0
 
-    if market_state == MarketState.RANGE and not zone_confirmation:
-        return False, "BLOCKED: RANGE_REQUIRES_ZONE_CONFIRMATION", size_mult, conf_mult
+    # RANGE: SWING needs zone, CASHFLOW allows if score suffices (checked in main)
+    if market_state == MarketState.RANGE:
+        if mode == "SWING":
+            if not zone_confirmation:
+                if RANGE_ALLOW_OUTSIDE_ZONE and zone_state in ("OUTSIDE", None) and (zone_confidence or 0) < 40:
+                    pass
+                else:
+                    return False, "BLOCKED: RANGE_REQUIRES_ZONE_CONFIRMATION", size_mult, conf_mult, 1.0
+        # CASHFLOW: pass here; RANGE_SCORE_TOO_LOW (score < 72) checked in futures_signals after final_score
 
-    loc_ok, loc_reason = location_block(location, signal_direction)
+    loc_ok, loc_reason, loc_tp_mod = location_block(
+        location, signal_direction, zone_confidence=zone_confidence or 0, mode=mode
+    )
     if not loc_ok:
-        return False, loc_reason, size_mult, conf_mult
+        return False, loc_reason, size_mult, conf_mult, 1.0
 
     if zone_state and zone_confidence is not None:
         zone_allowed, zone_reason = zone_gate_decision(
             zone_state=zone_state,
             zone_confidence=zone_confidence,
             resolution_confirmed=zone_confirmation,
+            mode=mode,
         )
         if not zone_allowed:
-            return False, f"BLOCKED: {zone_reason}", size_mult, conf_mult
+            return False, f"BLOCKED: {zone_reason}", size_mult, conf_mult, 1.0
 
     if zone_state in ("NEAR", "INSIDE") and zone_type and approach_direction:
         if zone_type == "DEMAND" and signal_direction == "SHORT" and approach_direction == "UP":
-            return False, "BLOCKED: DEMAND_APPROACH_FROM_BELOW", size_mult, conf_mult
+            return False, "BLOCKED: DEMAND_APPROACH_FROM_BELOW", size_mult, conf_mult, 1.0
         if zone_type == "SUPPLY" and signal_direction == "LONG" and approach_direction == "DOWN":
-            return False, "BLOCKED: SUPPLY_APPROACH_FROM_ABOVE", size_mult, conf_mult
+            return False, "BLOCKED: SUPPLY_APPROACH_FROM_ABOVE", size_mult, conf_mult, 1.0
 
     if zone_state in ("INSIDE", "NEAR") and not zone_confirmation:
-        return False, "BLOCKED: ZONE_NOT_RESOLVED", size_mult, conf_mult
+        return False, "BLOCKED: ZONE_NOT_RESOLVED", size_mult, conf_mult, 1.0
 
     if zone_resolution_state in (ZoneResolutionState.WAIT_RESOLUTION, ZoneResolutionState.INSIDE):
-        return False, "BLOCKED: ZONE_RESOLUTION_WAIT", size_mult, conf_mult
+        return False, "BLOCKED: ZONE_RESOLUTION_WAIT", size_mult, conf_mult, 1.0
 
     if zone_resolution_state == ZoneResolutionState.CONFIRMED_BREAK:
         if signal_direction == "LONG" and location in (Location.AT_DEMAND, Location.BELOW_DEMAND):
-            return False, "BLOCKED: DEMAND_BREAKDOWN_CONFIRMED", size_mult, conf_mult
+            return False, "BLOCKED: DEMAND_BREAKDOWN_CONFIRMED", size_mult, conf_mult, 1.0
         if signal_direction == "SHORT" and location in (Location.AT_SUPPLY, Location.ABOVE_SUPPLY):
-            return False, "BLOCKED: SUPPLY_BREAKOUT_CONFIRMED", size_mult, conf_mult
+            return False, "BLOCKED: SUPPLY_BREAKOUT_CONFIRMED", size_mult, conf_mult, 1.0
 
     if regime_ctx is not None:
         regime = detect_market_regime(regime_ctx)
         if regime_flip_block(signal_direction, regime):
-            return False, f"BLOCKED_BY_REGIME ({regime})", size_mult, conf_mult
+            return False, f"BLOCKED_BY_REGIME ({regime})", size_mult, conf_mult, 1.0
         if expansion_ctx is not None:
             if expansion_bias_block(
                 signal_direction,
@@ -121,89 +136,92 @@ def evaluate_signal(
                 expansion_ctx.get("pullback_depth_pct", 0),
                 expansion_ctx.get("atr_pct", 0),
             ):
-                return False, "BLOCKED_BY_EXPANSION", size_mult, conf_mult
+                return False, "BLOCKED_BY_EXPANSION", size_mult, conf_mult, 1.0
 
     if location == Location.AT_SUPPLY and signal_direction == "SHORT":
         if fake_breakout_result and fake_breakout_result.confirmed:
             if mode == "SWING":
-                return False, "BLOCKED: OF_FAKE_BREAKOUT", size_mult, conf_mult
+                return False, "BLOCKED: OF_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
             if rejection_result and rejection_result.confirmed and entry_delay_result and entry_delay_result.state == "CONFIRMED":
                 size_mult *= 0.5
                 conf_mult *= 0.7
             else:
-                return False, "BLOCKED: OF_FAKE_BREAKOUT_NEEDS_REJECTION", size_mult, conf_mult
+                return False, "BLOCKED: OF_FAKE_BREAKOUT_NEEDS_REJECTION", size_mult, conf_mult, 1.0
         else:
-            return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult
+            return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
     if location == Location.AT_DEMAND and signal_direction == "LONG":
         if fake_breakout_result and fake_breakout_result.confirmed:
             if mode == "SWING":
-                return False, "BLOCKED: OF_FAKE_BREAKOUT", size_mult, conf_mult
+                return False, "BLOCKED: OF_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
             if rejection_result and rejection_result.confirmed and entry_delay_result and entry_delay_result.state == "CONFIRMED":
                 size_mult *= 0.5
                 conf_mult *= 0.7
             else:
-                return False, "BLOCKED: OF_FAKE_BREAKOUT_NEEDS_REJECTION", size_mult, conf_mult
+                return False, "BLOCKED: OF_FAKE_BREAKOUT_NEEDS_REJECTION", size_mult, conf_mult, 1.0
         else:
-            return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult
+            return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
 
     if mode == "SWING":
         if signal_direction == "LONG" and not breakout_ok:
-            return False, "BLOCKED: NO_SUPPLY_BREAKOUT", size_mult, conf_mult
+            return False, "BLOCKED: NO_SUPPLY_BREAKOUT", size_mult, conf_mult, 1.0
         if signal_direction == "SHORT" and not breakout_ok:
-            return False, "BLOCKED: NO_DEMAND_BREAKOUT", size_mult, conf_mult
+            return False, "BLOCKED: NO_DEMAND_BREAKOUT", size_mult, conf_mult, 1.0
         if location in (Location.MID_RANGE,):
-            return False, "BLOCKED: MID_RANGE_SWING", size_mult, conf_mult
+            return False, "BLOCKED: MID_RANGE_SWING", size_mult, conf_mult, 1.0
     else:
         if signal_direction == "LONG" and location == Location.AT_SUPPLY:
             if not breakout_ok:
-                return False, "BLOCKED: NO_SUPPLY_BREAKOUT", size_mult, conf_mult
+                return False, "BLOCKED: NO_SUPPLY_BREAKOUT", size_mult, conf_mult, 1.0
 
     if rejection_result and location == Location.AT_SUPPLY and signal_direction == "SHORT":
         min_score = 6 if mode == "SWING" else 4
         if rejection_result.score < min_score:
-            return False, f"BLOCKED: REJECTION_{rejection_result.reason}", size_mult, conf_mult
+            return False, f"BLOCKED: REJECTION_{rejection_result.reason}", size_mult, conf_mult, 1.0
     if rejection_result and location == Location.AT_DEMAND and signal_direction == "LONG":
         min_score = 6 if mode == "SWING" else 4
         if rejection_result.score < min_score:
-            return False, f"BLOCKED: REJECTION_{rejection_result.reason}", size_mult, conf_mult
+            return False, f"BLOCKED: REJECTION_{rejection_result.reason}", size_mult, conf_mult, 1.0
 
     if entry_delay_result:
         if entry_delay_result.state != "CONFIRMED":
-            return False, f"BLOCKED: ENTRY_DELAY_{entry_delay_result.state}", size_mult, conf_mult
+            return False, f"BLOCKED: ENTRY_DELAY_{entry_delay_result.state}", size_mult, conf_mult, 1.0
 
     if market_state == MarketState.STRONG_BEAR and signal_direction == "SHORT":
         if not pullback_result:
-            return False, "BLOCKED: PULLBACK_MISSING", size_mult, conf_mult
+            return False, "BLOCKED: PULLBACK_MISSING", size_mult, conf_mult, 1.0
         if pullback_result.state != "HEALTHY_PULLBACK":
             if pullback_result.state == "OVEREXTENDED":
                 if mode == "SWING":
-                    return False, "BLOCKED: PULLBACK_OVEREXTENDED_WAIT", size_mult, conf_mult
+                    return False, "BLOCKED: PULLBACK_OVEREXTENDED_WAIT", size_mult, conf_mult, 1.0
                 if rejection_result and rejection_result.confirmed and entry_delay_result and entry_delay_result.state == "CONFIRMED":
                     size_mult *= 0.5
                     conf_mult *= 0.7
                 else:
-                    return False, "BLOCKED: PULLBACK_OVEREXTENDED_WAIT", size_mult, conf_mult
+                    return False, "BLOCKED: PULLBACK_OVEREXTENDED_WAIT", size_mult, conf_mult, 1.0
             else:
-                return False, "BLOCKED: PULLBACK_NOT_READY", size_mult, conf_mult
+                return False, "BLOCKED: PULLBACK_NOT_READY", size_mult, conf_mult, 1.0
 
-    if rsi_value is not None:
-        if signal_direction == "SHORT" and rsi_value <= 25:
+    # RSI veto – only extreme; mode-dependent. Inactive if zone_confidence < 40
+    if rsi_value is not None and (zone_confidence or 0) >= 40:
+        short_veto = 25 if mode == "CASHFLOW" else 30
+        long_veto = 75 if mode == "CASHFLOW" else 70
+        if signal_direction == "SHORT" and rsi_value <= short_veto:
             if zone_state in ("NEAR", "INSIDE"):
-                return False, "BLOCKED: RSI_OVERSOLD_AT_DEMAND", size_mult, conf_mult
+                return False, "BLOCKED: RSI_OVERSOLD_AT_DEMAND", size_mult, conf_mult, 1.0
             if pullback_state == "ENTER" or recent_impulse:
-                return False, "BLOCKED: RSI_OVERSOLD_LATE_SHORT", size_mult, conf_mult
-        if signal_direction == "LONG" and rsi_value >= 75:
+                return False, "BLOCKED: RSI_OVERSOLD_LATE_SHORT", size_mult, conf_mult, 1.0
+        if signal_direction == "LONG" and rsi_value >= long_veto:
             if zone_state in ("NEAR", "INSIDE"):
-                return False, "BLOCKED: RSI_OVERBOUGHT_AT_SUPPLY", size_mult, conf_mult
+                return False, "BLOCKED: RSI_OVERBOUGHT_AT_SUPPLY", size_mult, conf_mult, 1.0
             if pullback_state == "ENTER" or recent_impulse:
-                return False, "BLOCKED: RSI_OVERBOUGHT_LATE_LONG", size_mult, conf_mult
+                return False, "BLOCKED: RSI_OVERBOUGHT_LATE_LONG", size_mult, conf_mult, 1.0
 
     if indicator_bias == "BLOCK_SHORT" and signal_direction == "SHORT":
-        return False, "BLOCKED: INDICATOR_BLOCK_SHORT", size_mult, conf_mult
+        return False, "BLOCKED: INDICATOR_BLOCK_SHORT", size_mult, conf_mult, 1.0
     if indicator_bias == "BLOCK_LONG" and signal_direction == "LONG":
-        return False, "BLOCKED: INDICATOR_BLOCK_LONG", size_mult, conf_mult
+        return False, "BLOCKED: INDICATOR_BLOCK_LONG", size_mult, conf_mult, 1.0
 
     if mode != "CASHFLOW" and indicator_score_value < 2:
-        return False, "BLOCKED: WEAK_INDICATORS", size_mult, conf_mult
+        return False, "BLOCKED: WEAK_INDICATORS", size_mult, conf_mult, 1.0
 
-    return True, "SIGNAL_ACCEPTED", size_mult, conf_mult
+    return True, "SIGNAL_ACCEPTED", size_mult, conf_mult, loc_tp_mod

@@ -271,6 +271,10 @@ from config import (
     TRADING_HOURS_ENABLED,
     ZONE_RESOLUTION_MIN_BODY_PCT,
     ZONE_RESOLUTION_REQUIRED_CLOSES,
+    RANGE_ALLOW_OUTSIDE_ZONE,
+    ZONE_RESOLUTION_RELAXED_BODY_PCT,
+    KRAKEN_OBSERVER_MODE,
+    TRAILING_STOP_ON_EXCHANGE,
 )
 try:
     from xgboost_trading import XGBoostTradingEngine, XGBoostConfig
@@ -344,10 +348,11 @@ TIMEFRAME_WEEKLY = "1w"
 
 # Signal settings
 CHECK_INTERVAL = 30  # Day trading / cashflow mode – faster signal detection
-MIN_SCORE = 0            # Disable score-based veto
+MIN_SCORE = 55            # Minimum score for high-quality signals (was 0)
 LEVERAGE = 5              # Kraken Futures fixed leverage
-MIN_SIGNAL_CONFIDENCE = 0.50  # Minimum confidence to send signals
+MIN_SIGNAL_CONFIDENCE = 0.60  # Minimum confidence (was 0.50)
 SIGNAL_COOLDOWN_MINUTES = 30  # Minimum time between signals per asset
+MAX_SIGNALS_PER_DAY = 5   # Global daily limit – max 5 signals per day
 
 # Indicator settings
 RSI_OVERSOLD = 30.0       # Cashflow mode: allow less extreme oversold
@@ -382,7 +387,7 @@ AUTO_TRADE_MARGIN_USD = 50         # Initial margin in USD per trade (position =
 MAX_MARGIN_USD = 50                # Hard cap per-trade margin in USD
 MAX_MARGIN_EUR = 50                # Hard cap per-trade margin in EUR (FX converted)
 AUTO_TRADE_MAX_POSITIONS = RISK["MAX_POSITIONS"]       # Maximum concurrent open positions
-AUTO_TRADE_MIN_SCORE = 0
+AUTO_TRADE_MIN_SCORE = 55   # Same as MIN_SCORE – only high-quality for auto-trade
 AUTO_CLOSE_ON_SL = True            # Automatically close position when SL is hit
 AUTO_CLOSE_ON_TP3 = True           # Automatically close remaining position at TP3
 
@@ -406,7 +411,7 @@ POSITION_CORRELATION_MIN_POINTS = 20
 POSITION_CORRELATION_TIMEFRAME = TIMEFRAME_TREND
 
 # Signalų filtravimo pakeitimai
-PROFIT_MODE_MIN_SCORE = 0
+PROFIT_MODE_MIN_SCORE = 55  # Align with MIN_SCORE for quality
 PROFIT_MODE_MIN_CONFIDENCE = 0.0
 ACCEPT_PARTIAL_CONFLUENCE = True  # Priimti signalus su daline confluence
 
@@ -438,7 +443,7 @@ LIMIT_CHASE_MAX_STEPS = 3              # Number of chase attempts
 LIMIT_CHASE_STEP_PCT = 0.06            # Marketable limit offset (%)
 LIMIT_MAX_SLIPPAGE_PCT = 0.10          # Max allowed offset from initial price (%)
 LIMIT_FALLBACK_TO_MARKET = True        # Fallback to market on timeout (high-quality only)
-LIMIT_FALLBACK_MIN_SCORE = 0
+LIMIT_FALLBACK_MIN_SCORE = 55  # Align with MIN_SCORE for quality
 ENTRY_OPTIMIZED_MAX_DEVIATION_PCT = 0.25  # Max optimized entry deviation (%)
 
 # ================================
@@ -483,7 +488,7 @@ LEVERAGE_TIERS = {
 # ================================
 # HTTP SERVER
 # ================================
-ENABLE_HTTP_SERVER = False  # Disable Flask UI/API when not needed
+ENABLE_HTTP_SERVER = True  # Flask dashboard at http://127.0.0.1:5000
 
 # ================================
 # MARKET REGIME DETECTION (from v7.4)
@@ -497,7 +502,7 @@ DEFENSIVE_MODE_ENABLED = True # Block new LONGs in BEAR market
 # ================================
 # SMART COUNTER-TREND (v8.9.2)
 # ================================
-QUANT_ENABLED = False                # Fully disable AI/Quant processing
+QUANT_ENABLED = True                 # Matematinė analizė (Monte Carlo, ARIMA, Mean Reversion)
 QUANT_COUNTER_TREND_ENABLED = False  # Disable quant-based counter-trend
 QUANT_COUNTER_TREND_MIN_BIAS = 15    # Minimum quant score to allow counter-trend LONG (+15 or higher)
 QUANT_DIRECTION_ENABLED = False      # Disable AI/Quant from direction decisions
@@ -1234,7 +1239,7 @@ def fetch_multi_collateral_balance():
     if not POSITION_TRACKING_ENABLED:
         return account_balance_cache
     
-    if DISABLE_KRAKEN_IN_SIGNAL_ONLY and not AUTO_TRADING_ENABLED:
+    if DISABLE_KRAKEN_IN_SIGNAL_ONLY and not AUTO_TRADING_ENABLED and not KRAKEN_OBSERVER_MODE:
         return account_balance_cache
     
     try:
@@ -1322,6 +1327,8 @@ def get_available_balance():
 # ================================
 signals_history = []
 last_signals = {}
+daily_signal_count = 0
+daily_signal_reset_date = None  # UTC date, resets at midnight
 bot_stats = {
     "total_signals": 0,
     "long_signals": 0,
@@ -1377,6 +1384,25 @@ EMA_DISTANCE_OVERRIDE_MIN_SCORE = 40
 
 # Trade mode: CASHFLOW or SWING
 TRADE_MODE = "CASHFLOW"
+
+
+def tp_multiplier_by_zone(zone_confidence, trade_mode):
+    """
+    CASHFLOW: scale TP by zone confidence.
+    >= 70: 1.0 | 50-69: 0.65 | 35-49: 0.45 | < 35: 0.30
+    SWING: no scaling.
+    """
+    if trade_mode != "CASHFLOW":
+        return 1.0
+    zc = zone_confidence or 0
+    if zc >= 70:
+        return 1.0
+    if zc >= 50:
+        return 0.65
+    if zc >= 35:
+        return 0.45
+    return 0.30
+
 
 ZONE_IMPULSE_MULT = 1.5
 ZONE_BUFFER_ATR = 0.2
@@ -3176,12 +3202,32 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
         print(f"  ❌ AUTO-TRADE ERROR: {e}")
         return {"success": False, "reason": str(e)}
 
+async def cancel_existing_sl_orders_for_symbol(symbol):
+    """Cancel any existing reduce-only/stop orders for symbol (e.g. user-set SL). Used before placing first trailing SL."""
+    try:
+        orders = await safe_exchange_call(exchange.fetch_open_orders, symbol, timeout=5)
+        if not orders:
+            return
+        cancelled = 0
+        for o in orders:
+            info = o.get('info', {})
+            if info.get('reduceOnly') or o.get('reduceOnly'):
+                try:
+                    await safe_exchange_call(exchange.cancel_order, o['id'], symbol, timeout=3)
+                    cancelled += 1
+                    print(f"     🗑️ Cancelled existing SL/TP order (ID: {o['id']})")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"     ⚠️ Could not fetch/cancel existing orders: {e}")
+
 async def update_exchange_sl(symbol, new_sl_price, position_size):
     """
     v8.9.21: Update exchange-side stop loss order when trailing stop moves.
     
     Cancel old SL order and place new one at updated price.
-    WITH RETRY LOGIC AND VERIFICATION.
+    TRAILING_STOP_ON_EXCHANGE: For Kraken-imported positions (no exchange_sl_order_id),
+    cancel any existing reduce-only orders first, then place our trailing SL.
     """
     global open_positions
     
@@ -3198,8 +3244,11 @@ async def update_exchange_sl(symbol, new_sl_price, position_size):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Cancel old SL order if exists
-            if old_sl_order_id:
+            # First-time placement: cancel any existing reduce-only orders (user's manual SL)
+            if not old_sl_order_id:
+                await cancel_existing_sl_orders_for_symbol(symbol)
+            # Cancel our old SL order if exists
+            elif old_sl_order_id:
                 try:
                     await safe_exchange_call(exchange.cancel_order, old_sl_order_id, symbol, timeout=5)
                     print(f"     🗑️ Old SL order cancelled (ID: {old_sl_order_id})")
@@ -3207,12 +3256,12 @@ async def update_exchange_sl(symbol, new_sl_price, position_size):
                     print(f"     ⚠️ Could not cancel old SL: {cancel_err}")
                     # Continue anyway - new order will replace it
             
-            # Place new SL order
+            # Place new SL order (Kraken Futures: type 'stop' with triggerPrice)
             sl_side = "sell" if direction == "LONG" else "buy"
             sl_order = await safe_exchange_call(
                 exchange.create_order,
-                symbol, 'market', sl_side, remaining_size, None, None,
-                {'stopPrice': new_sl_price, 'reduceOnly': True},
+                symbol, 'stop', sl_side, remaining_size, new_sl_price, None,
+                {'triggerPrice': new_sl_price, 'reduceOnly': True},
                 timeout=10, max_retries=2
             )
             
@@ -3492,9 +3541,8 @@ async def fetch_kraken_positions():
     if not POSITION_TRACKING_ENABLED:
         return {}
     
-    if DISABLE_KRAKEN_IN_SIGNAL_ONLY and not AUTO_TRADING_ENABLED:
+    if DISABLE_KRAKEN_IN_SIGNAL_ONLY and not AUTO_TRADING_ENABLED and not KRAKEN_OBSERVER_MODE:
         return kraken_positions['positions']
-        return {}
     
     now = datetime.now(timezone.utc)
     
@@ -7027,6 +7075,8 @@ def generate_entry_signal(
         try:
             atr_ltf = calc_atr(df).iloc[-1]
             ltf_blocks = OrderBlocks.detect_htf_order_blocks(df, atr_ltf, impulse_mult=ZONE_IMPULSE_MULT)
+            ltf_supply = []
+            ltf_demand = []
             for ob in ltf_blocks:
                 zone_type = OrderBlocks.classify_zone(ob)
                 if ob.contains_price(current_price):
@@ -7038,6 +7088,29 @@ def generate_entry_signal(
                     if zone_type == "DEMAND" and htf_demand_zone is None:
                         in_demand_zone = True
                         htf_demand_zone = ob
+                        htf_demand_zone.atr = atr_ltf
+                        zone_source = "LTF"
+                if zone_type == "SUPPLY":
+                    ltf_supply.append(ob)
+                if zone_type == "DEMAND":
+                    ltf_demand.append(ob)
+            if zone_source is None and (ltf_supply or ltf_demand):
+                def _zone_distance(z):
+                    if z.contains_price(current_price):
+                        return 0.0
+                    return min(abs(current_price - z.top), abs(current_price - z.bottom))
+                nearest_supply = min(ltf_supply, key=_zone_distance) if ltf_supply else None
+                nearest_demand = min(ltf_demand, key=_zone_distance) if ltf_demand else None
+                supply_dist = _zone_distance(nearest_supply) if nearest_supply else None
+                demand_dist = _zone_distance(nearest_demand) if nearest_demand else None
+                max_dist = atr_ltf * 3 if atr_ltf else None
+                if max_dist and ((supply_dist is not None and supply_dist <= max_dist) or (demand_dist is not None and demand_dist <= max_dist)):
+                    if supply_dist is not None and (demand_dist is None or supply_dist <= demand_dist):
+                        htf_supply_zone = nearest_supply
+                        htf_supply_zone.atr = atr_ltf
+                        zone_source = "LTF"
+                    elif demand_dist is not None:
+                        htf_demand_zone = nearest_demand
                         htf_demand_zone.atr = atr_ltf
                         zone_source = "LTF"
             if zone_source == "LTF":
@@ -7723,7 +7796,7 @@ def generate_entry_signal(
             zone_context_type = "SUPPLY"
 
         zone_engine = ZoneResolutionEngine(
-            min_body_pct=ZONE_RESOLUTION_MIN_BODY_PCT,
+            min_body_pct=ZONE_RESOLUTION_RELAXED_BODY_PCT,
             required_closes=ZONE_RESOLUTION_REQUIRED_CLOSES,
         )
         zone_state = "OUTSIDE"
@@ -7813,10 +7886,10 @@ def generate_entry_signal(
                 confirmed_closes = 0
                 for c in candles_15m:
                     if zone_type == ZoneType.SUPPLY:
-                        if c.close > active_zone.high and c.body_pct >= ZONE_RESOLUTION_MIN_BODY_PCT:
+                        if c.close > active_zone.high and c.body_pct >= ZONE_RESOLUTION_RELAXED_BODY_PCT:
                             confirmed_closes += 1
                     if zone_type == ZoneType.DEMAND:
-                        if c.close < active_zone.low and c.body_pct >= ZONE_RESOLUTION_MIN_BODY_PCT:
+                        if c.close < active_zone.low and c.body_pct >= ZONE_RESOLUTION_RELAXED_BODY_PCT:
                             confirmed_closes += 1
                 zone_resolution_closes = f"{confirmed_closes}/{zone_engine.required_closes}"
             print(
@@ -7824,7 +7897,7 @@ def generate_entry_signal(
                 f"{zone_resolution_reason} | CLOSES={zone_resolution_closes}"
             )
 
-        accepted, decision_reason, decision_size_mult, decision_conf_mult = evaluate_signal(
+        accepted, decision_reason, decision_size_mult, decision_conf_mult, decision_tp_mod = evaluate_signal(
             market_state=market_state,
             location=location_enum,
             signal_direction=base_direction,
@@ -7867,22 +7940,22 @@ def generate_entry_signal(
             print(
                 f"  → ENTRY_DELAY: {entry_delay_result.state} | {entry_delay_result.reason}"
             )
-        log_decision(
-            symbol,
-            base_direction,
-            market_state,
-            decision_reason,
-            zone_resolution=zone_resolution_state,
-            zone_reason=zone_resolution_reason,
-            zone_state=zone_state,
-            zone_confidence=zone_confidence,
-            zone_confirmation=zone_confirmation,
-            zone_source=zone_source,
-            approach_direction=approach_direction,
-            indicator_score=indicator_score_value,
-            indicator_bias=indicator_bias,
-        )
         if not accepted:
+            log_decision(
+                symbol,
+                base_direction,
+                market_state,
+                decision_reason,
+                zone_resolution=zone_resolution_state,
+                zone_reason=zone_resolution_reason,
+                zone_state=zone_state,
+                zone_confidence=zone_confidence,
+                zone_confirmation=zone_confirmation,
+                zone_source=zone_source,
+                approach_direction=approach_direction,
+                indicator_score=indicator_score_value,
+                indicator_bias=indicator_bias,
+            )
             record_block("DECISION_ENGINE")
             return None
 
@@ -7896,6 +7969,21 @@ def generate_entry_signal(
         allowed, rsi_penalty, rsi_reason = evaluate_1h_rsi(rsi_1h, base_direction)
         if not allowed:
             print(f"  → ⏳ WAIT: RSI filter ({rsi_reason})")
+            log_decision(
+                symbol,
+                base_direction,
+                market_state,
+                f"BLOCKED: {rsi_reason}",
+                zone_resolution=zone_resolution_state,
+                zone_reason=zone_resolution_reason,
+                zone_state=zone_state,
+                zone_confidence=zone_confidence,
+                zone_confirmation=zone_confirmation,
+                zone_source=zone_source,
+                approach_direction=approach_direction,
+                indicator_score=indicator_score_value,
+                indicator_bias=indicator_bias,
+            )
             record_block("RSI_SOFT_FILTER")
             return None
         if rsi_penalty < 0:
@@ -7931,6 +8019,21 @@ def generate_entry_signal(
                 print(f"  ⚠️ {symbol}: {base_direction} RSI soft-bypass (confluence={confluence_score}/55, rsi_1h={rsi_1h:.1f}, -5 score)")
             else:
                 print(f"  ❌ {symbol}: {base_direction} blocked by 1H RSI filter - {rsi_filter_reason}")
+                log_decision(
+                    symbol,
+                    base_direction,
+                    market_state,
+                    f"BLOCKED: {rsi_filter_reason}",
+                    zone_resolution=zone_resolution_state,
+                    zone_reason=zone_resolution_reason,
+                    zone_state=zone_state,
+                    zone_confidence=zone_confidence,
+                    zone_confirmation=zone_confirmation,
+                    zone_source=zone_source,
+                    approach_direction=approach_direction,
+                    indicator_score=indicator_score_value,
+                    indicator_bias=indicator_bias,
+                )
                 record_block("RSI_1H_PREFILTER")
                 return None
         if skip_rsi_filter and not rsi_filter_ok:
@@ -8004,7 +8107,31 @@ def generate_entry_signal(
             effective_final_min = effective_min_score_short
         else:
             effective_final_min = MIN_SCORE
-        
+
+        # RANGE + CASHFLOW: score-based (not hard block). Block only when zone_confidence < 40 AND score < 72.
+        # Bypass: fake_breakout_score >= 4 → ALLOW even without zone
+        if (market_state == MarketState.RANGE and TRADE_MODE == "CASHFLOW"):
+            fake_bypass = fake_breakout_result and getattr(fake_breakout_result, "score", 0) >= 4
+            if not fake_bypass and (zone_confidence or 0) < 40 and final_score < 72:
+                print(f"  ❌ {symbol}: RANGE zone_conf<40 and score<72 (got {final_score}, zone_conf={zone_confidence})")
+                log_decision(
+                    symbol,
+                    base_direction,
+                    market_state,
+                    "BLOCKED: RANGE_SCORE_TOO_LOW",
+                    zone_resolution=zone_resolution_state,
+                    zone_reason=zone_resolution_reason,
+                    zone_state=zone_state,
+                    zone_confidence=zone_confidence,
+                    zone_confirmation=zone_confirmation,
+                    zone_source=zone_source,
+                    approach_direction=approach_direction,
+                    indicator_score=indicator_score_value,
+                    indicator_bias=indicator_bias,
+                )
+                record_block("RANGE_SCORE")
+                return None
+
         if final_score >= effective_final_min:
             # v8.9.20: ConsolidationGuard - Block signals in range/consolidation
             is_consol, consol_reasons = is_consolidating(df, current_price, signal_data={
@@ -8075,6 +8202,20 @@ def generate_entry_signal(
             # Apply decision engine size/confidence adjustments
             size_multiplier *= decision_size_mult * htf_size_mult
             confidence = max(0.0, min(1.0, confidence * decision_conf_mult * htf_conf_mult))
+
+            # CASHFLOW: scale TP by zone (weak zone = lower expectations)
+            zone_tp_mult = tp_multiplier_by_zone(zone_confidence, TRADE_MODE)
+            tp_mult = min(decision_tp_mod, zone_tp_mult)
+            if tp_mult < 1.0:
+                if base_direction == "LONG":
+                    tp1_sr = current_price + (tp1_sr - current_price) * tp_mult
+                    tp2_distance *= tp_mult
+                    tp3_distance *= tp_mult
+                else:
+                    tp1_sr = current_price - (current_price - tp1_sr) * tp_mult
+                    tp2_distance *= tp_mult
+                    tp3_distance *= tp_mult
+                all_signals.append(f"TP_SCALED_{int(tp_mult*100)}")
 
         zone_resolution_telemetry = {
             "zone": zone_context_type or "",
@@ -8837,16 +8978,19 @@ async def manage_open_positions():
             if updates['trailing_update']:
                 # v8.9.24: Only notify on significant trailing updates (every 1.0% instead of 0.5%)
                 old_sl = position.get('last_notified_sl', position['original_sl'])
-                sl_change_pct = abs((updates['trailing_update'] - old_sl) / old_sl * 100)
-                # Also add minimum time between trailing notifications (60 seconds)
+                sl_change_pct = abs((updates['trailing_update'] - old_sl) / old_sl * 100) if old_sl else 999.0
                 last_trailing_notify = position.get('last_trailing_notify_time')
                 time_ok = last_trailing_notify is None or (datetime.now(timezone.utc) - last_trailing_notify).total_seconds() >= 60
+                remaining_size = position.get('remaining_size', position.get('size', 0))
+                is_first_place = not position.get('exchange_sl_order_id')
+                # Update Kraken: first time (Kraken-imported pos) OR significant move (≥1%)
+                should_update_exchange = (
+                    TRAILING_STOP_ON_EXCHANGE and POSITION_TRACKING_ENABLED and remaining_size > 0 and
+                    (is_first_place or (sl_change_pct >= 1.0 and time_ok))
+                )
+                if should_update_exchange:
+                    await update_exchange_sl(symbol, updates['trailing_update'], remaining_size)
                 if sl_change_pct >= 1.0 and time_ok:
-                    # v8.9.21: Update exchange-side SL when trailing moves significantly
-                    remaining_size = position.get('remaining_size', position.get('size', 0))
-                    if position.get('exchange_sl_order_id') and remaining_size > 0:
-                        await update_exchange_sl(symbol, updates['trailing_update'], remaining_size)
-                    
                     await send_position_update(position, "TRAILING_UPDATE", current_price, updates['trailing_update'])
                     position['last_notified_sl'] = updates['trailing_update']
                     position['last_trailing_notify_time'] = datetime.now(timezone.utc)
@@ -9985,6 +10129,18 @@ async def check_signals():
                     except Exception as e:
                         print(f"  ⚠️ HTF lock error: {e}")
 
+                    signal["market_state"] = getattr(market_state, "value", market_state)
+                    signal["decision_reason"] = decision_reason
+                    signal["zone_resolution_state"] = getattr(zone_resolution_state, "value", zone_resolution_state)
+                    signal["zone_state"] = zone_state
+                    signal["zone_confidence"] = zone_confidence
+                    signal["zone_confirmation"] = zone_confirmation
+                    signal["zone_source"] = zone_source
+                    signal["approach_direction"] = approach_direction
+                    signal["indicator_score_value"] = indicator_score_value
+                    signal["indicator_bias"] = indicator_bias
+                    signal["zone_resolution_reason"] = zone_resolution_reason
+
                     # v8.9.19: Collect signal for sorted processing instead of immediate execution
                     collected_signals.append({
                         'symbol': symbol,
@@ -10091,13 +10247,54 @@ async def check_signals():
             signal = sig_data['signal']
             asset_name = sig_data['asset_name']
             
+            last_sig = last_signals.get(symbol, {})
+            last_signal_time = last_sig.get('time')
+            if isinstance(last_signal_time, str):
+                try:
+                    last_signal_time = datetime.fromisoformat(last_signal_time)
+                except Exception:
+                    last_signal_time = None
+            cooldown = timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
+            if last_signal_time and (signal['time'] - last_signal_time) <= cooldown:
+                print(f"  → Signal on cooldown ({SIGNAL_COOLDOWN_MINUTES}m) for {asset_name}")
+                record_block("SIGNAL_COOLDOWN")
+                continue
+
             if signal.get('confidence', 0) < MIN_SIGNAL_CONFIDENCE:
                 print(f"  → {asset_name} skipped: low confidence ({signal.get('confidence', 0):.2f})")
                 record_block("MIN_CONFIDENCE")
                 continue
 
+            # Daily signal limit (max 5 per day)
+            global daily_signal_count, daily_signal_reset_date
+            now_utc = datetime.now(timezone.utc)
+            today_utc = now_utc.date()
+            if daily_signal_reset_date != today_utc:
+                daily_signal_reset_date = today_utc
+                daily_signal_count = 0
+            if daily_signal_count >= MAX_SIGNALS_PER_DAY:
+                print(f"  → Daily limit reached ({MAX_SIGNALS_PER_DAY} signals today)")
+                record_block("DAILY_SIGNAL_LIMIT")
+                continue
+            daily_signal_count += 1
+
             # Send Telegram signal
             await send_telegram_signal(signal)
+            log_decision(
+                symbol,
+                signal.get("direction"),
+                signal.get("market_state"),
+                "SIGNAL_ACCEPTED",
+                zone_resolution=signal.get("zone_resolution_state"),
+                zone_reason=signal.get("zone_resolution_reason"),
+                zone_state=signal.get("zone_state"),
+                zone_confidence=signal.get("zone_confidence"),
+                zone_confirmation=signal.get("zone_confirmation"),
+                zone_source=signal.get("zone_source"),
+                approach_direction=signal.get("approach_direction"),
+                indicator_score=signal.get("indicator_score_value"),
+                indicator_bias=signal.get("indicator_bias"),
+            )
             
             last_signals[symbol] = signal
             signals_history.append(signal)
@@ -10538,11 +10735,18 @@ async def signal_loop():
     print(f"📊 Assets: {', '.join(ASSET_NAMES.values())}")
     print(f"⏱️ Timeframes: {TIMEFRAME_MACRO} (macro) | {TIMEFRAME_TREND} (trend) | {TIMEFRAME_ENTRY} (entry) | {TIMEFRAME_5M_OPTIMIZE} (optimize)")
     print(f"📱 Telegram: {'Configured' if TELEGRAM_TOKEN else 'NOT CONFIGURED'}")
+    if KRAKEN_OBSERVER_MODE:
+        if POSITION_TRACKING_ENABLED:
+            print(f"👁️ KRAKEN OBSERVER: ON (read-only, tracking positions & stats)")
+        else:
+            print(f"👁️ KRAKEN OBSERVER: ON but no API keys - add KRAKEN_FUTURES_API_KEY/SECRET to .env")
     print(f"🤖 AUTO-TRADING: {'ON - $' + str(AUTO_TRADE_MARGIN_USD) + ' margin/trade, max ' + str(AUTO_TRADE_MAX_POSITIONS) + ' positions' if AUTO_TRADING_ENABLED else 'OFF'}")
     print(f"💰 Daily Loss Limit: -{DAILY_LOSS_LIMIT_PCT}% (${DAILY_LOSS_LIMIT_USD} fallback)")
     print(f"📊 Weekly Loss Limit: -{WEEKLY_LOSS_LIMIT_PCT}%")
     print(f"📉 Maximum Drawdown: -{MAX_DRAWDOWN_PCT}% from peak equity")
     print(f"📈 Trailing Stop: {'ENABLED' if TRAILING_ENABLED else 'DISABLED'} ({TRAILING_DISTANCE_PCT}%)")
+    if TRAILING_ENABLED and TRAILING_STOP_ON_EXCHANGE and POSITION_TRACKING_ENABLED:
+        print(f"🛡️ Trailing on Kraken: ON (SL orders placed & updated on exchange)")
     print(f"🛡️ Breakeven at TP1: {'YES' if BREAKEVEN_AT_TP1 else 'NO'}")
     print(f"🤖 Partial TP: {'ON - Auto-close 33% at TP1 & TP2' if PARTIAL_TP_ENABLED else 'OFF'}")
     print(f"🏛️ FOMC Filter: {'ON' if FOMC_BLACKOUT_ENABLED else 'OFF'}")
@@ -11142,7 +11346,38 @@ def api_stats():
             "wins": auto_trading_state.get("weekly_wins", 0),
             "losses": auto_trading_state.get("weekly_losses", 0),
         },
+        "start_time": bot_stats.get("start_time").isoformat() if bot_stats.get("start_time") else None,
     })
+
+@app.route('/api/stats/reset', methods=['POST'])
+def api_stats_reset():
+    """Nunulinti visą statistiką - signalai, wins, losses, daily/weekly P&L. Dashboard rodys nuo šios dienos."""
+    global bot_stats, auto_trading_state
+    try:
+        # 1. Reset signal_results.json
+        fresh_signals = {"signals": [], "stats": {"wins": 0, "losses": 0, "total_profit_pct": 0.0, "ct_wins": 0, "ct_losses": 0}}
+        save_signal_results(fresh_signals)
+        bot_stats["wins"] = 0
+        bot_stats["losses"] = 0
+        bot_stats["total_profit_pct"] = 0.0
+        # 2. Reset auto_trading_state
+        for k in ("daily_pnl", "daily_trades", "daily_wins", "daily_losses", "weekly_pnl", "weekly_trades", "weekly_wins", "weekly_losses"):
+            auto_trading_state[k] = 0
+        auto_trading_state["is_paused"] = False
+        auto_trading_state["pause_reason"] = None
+        auto_trading_state["pause_type"] = None
+        # 3. Ištrinti bot_state.json
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        # 4. Profit tracker reset (jei yra)
+        if profit_tracker:
+            try:
+                profit_tracker.reset_daily()
+            except Exception:
+                pass
+        return jsonify({"success": True, "message": "Statistika nunulinta"})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/profit')
 def api_profit():
@@ -11376,13 +11611,45 @@ def share_page():
     '''
     return share_html
 
+@app.route('/api/trades/history')
+def api_trades_history():
+    """Gauti sandorių istoriją (laimėjimai/pralaimėjimai) iš signal_results.json"""
+    data = load_signal_results()
+    marked = [s for s in data.get("signals", []) if s.get("result") in ("WIN", "LOSS")]
+    recent = list(reversed(marked[-50:]))  # Paskutiniai 50
+    trades = []
+    for s in recent:
+        asset = ASSET_NAMES.get(s.get("symbol", ""), s.get("symbol", "?"))
+        trades.append({
+            "id": s.get("id", ""),
+            "symbol": s.get("symbol", ""),
+            "asset": asset,
+            "direction": s.get("direction", ""),
+            "entry": s.get("entry", 0),
+            "result": s.get("result", ""),
+            "profit_pct": s.get("profit_pct") or 0,
+            "time": s.get("time", ""),
+            "marked_at": s.get("marked_at", ""),
+            "score": s.get("score", 0),
+        })
+    return jsonify({
+        "trades": trades,
+        "stats": data.get("stats", {}),
+    })
+
 @app.route('/api/positions')
 def api_positions():
-    """Gauti atviras pozicijas - naudoja open_positions dict"""
+    """Gauti atviras pozicijas - open_positions + Kraken pozicijos (observer mode)"""
+    TICKER_SYMBOLS = {
+        "PF_XBTUSD": "BTC/USD:USD", "PF_ETHUSD": "ETH/USD:USD", "PF_SOLUSD": "SOL/USD:USD",
+        "PF_XRPUSD": "XRP/USD:USD", "PF_LTCUSD": "LTC/USD:USD", "PF_ADAUSD": "ADA/USD:USD",
+        "PF_DOTUSD": "DOT/USD:USD", "PF_LINKUSD": "LINK/USD:USD",
+    }
     positions_data = []
     for symbol in FUTURES_ASSETS:
         asset_name = ASSET_NAMES.get(symbol, symbol)
         pos = open_positions.get(symbol)
+        kraken_pos = kraken_positions.get("positions", {}).get(symbol)
         
         if pos:
             # Get current price (use highest/lowest for P&L calculation)
@@ -11409,6 +11676,35 @@ def api_positions():
                 "tp1_hit": pos.get('tp1_hit', False),
                 "tp2_hit": pos.get('tp2_hit', False),
             })
+        elif kraken_pos:
+            entry_price = kraken_pos.get("entry_price", 0) or kraken_pos.get("entry", 0)
+            direction = kraken_pos.get("direction", "LONG")
+            try:
+                ticker_sym = TICKER_SYMBOLS.get(symbol)
+                ticker = exchange.fetch_ticker(ticker_sym) if ticker_sym else {}
+                current_price = ticker.get("last", entry_price) or entry_price
+            except Exception:
+                current_price = entry_price
+            if entry_price > 0:
+                pnl_pct = ((current_price - entry_price) / entry_price * 100) if direction == "LONG" else ((entry_price - current_price) / entry_price * 100)
+            else:
+                pnl_pct = 0
+            positions_data.append({
+                "asset": asset_name,
+                "active": True,
+                "direction": direction,
+                "entry": entry_price,
+                "current_price": current_price,
+                "pnl_pct": pnl_pct,
+                "sl": kraken_pos.get("sl", 0),
+                "tp1": kraken_pos.get("tp1", 0),
+                "tp2": kraken_pos.get("tp2", 0),
+                "tp3": kraken_pos.get("tp3", 0),
+                "trailing_active": False,
+                "breakeven_active": False,
+                "tp1_hit": False,
+                "tp2_hit": False,
+            })
         else:
             positions_data.append({
                 "asset": asset_name,
@@ -11431,78 +11727,51 @@ def api_positions():
 
 @app.route('/api/signals')
 def api_signals():
-    return jsonify([{
+    """Visi signalai: live (signals_history) + istorija (signal_results.json)"""
+    live = [{
         "symbol": s['symbol'],
         "asset": ASSET_NAMES.get(s['symbol'], s['symbol']),
         "direction": s['direction'],
-        "entry": s['price'],
-        "price": s['price'],
-        "sl": s['sl'],
-        "tp1": s['tp1'],
+        "entry": s.get('price', s.get('entry', 0)),
+        "price": s.get('price', s.get('entry', 0)),
+        "sl": s.get('sl', 0),
+        "tp1": s.get('tp1', 0),
         "score": s.get('score', 0),
         "trend": s.get('trend', 'NEUTRAL'),
-        "time": s['time'].strftime('%H:%M UTC') if isinstance(s['time'], datetime) else s.get('time', 'N/A')
-    } for s in reversed(signals_history[-20:])])
-    positions = []
-    
-    # Symbol mapping for ticker fetch
-    TICKER_SYMBOLS = {
-        "PF_XBTUSD": "BTC/USD:USD",
-        "PF_ETHUSD": "ETH/USD:USD",
-        "PF_SOLUSD": "SOL/USD:USD",
-        "PF_XRPUSD": "XRP/USD:USD",
-        "PF_LTCUSD": "LTC/USD:USD",
-        "PF_ADAUSD": "ADA/USD:USD",
-        "PF_DOTUSD": "DOT/USD:USD",
-    }
-    
-    # Naudoti Kraken pozicijas (real-time duomenys)
-    for symbol, kraken_pos in kraken_positions.get('positions', {}).items():
-        if not kraken_pos:
-            continue
-        
-        asset_name = ASSET_NAMES.get(symbol, symbol)
-        entry_price = kraken_pos.get('entry_price', 0)
-        direction = kraken_pos.get('direction', 'LONG')
-        leverage = kraken_pos.get('leverage', 1)
-        size_usd = kraken_pos.get('size_usd', 25)
-        contracts = kraken_pos.get('size', 0)
-        
-        # Gauti dabartinę kainą per ticker
-        try:
-            ticker_symbol = TICKER_SYMBOLS.get(symbol)
-            if ticker_symbol:
-                ticker = exchange.fetch_ticker(ticker_symbol)
-                current_price = ticker.get('last', entry_price) or entry_price
-            else:
-                current_price = entry_price
-        except:
-            current_price = entry_price
-        
-        # Skaičiuoti P&L
-        if entry_price > 0 and contracts > 0:
-            if direction == "LONG":
-                pnl_pct = (current_price - entry_price) / entry_price * 100
-                pnl_usd = (current_price - entry_price) * contracts
-            else:
-                pnl_pct = (entry_price - current_price) / entry_price * 100
-                pnl_usd = (entry_price - current_price) * contracts
-        else:
-            pnl_pct = 0
-            pnl_usd = 0
-        
-        positions.append({
-            "asset": asset_name,
-            "side": direction,
-            "entry": entry_price,
-            "current": current_price,
-            "pnl": pnl_usd,
-            "pnl_pct": pnl_pct,
-            "size": size_usd,
-            "leverage": leverage,
+        "time": s['time'].strftime('%H:%M UTC') if isinstance(s.get('time'), datetime) else str(s.get('time', 'N/A'))[:19],
+        "result": None,
+        "profit_pct": None,
+    } for s in reversed(signals_history[-20:])]
+    data = load_signal_results()
+    tracked = []
+    for s in data.get("signals", [])[-50:]:
+        t = s.get("time", "")
+        if isinstance(t, str) and len(t) > 10:
+            t = t[11:16] + " UTC" if "T" in t else t[:16]
+        tracked.append({
+            "symbol": s.get("symbol", ""),
+            "asset": ASSET_NAMES.get(s.get("symbol", ""), s.get("symbol", "?")),
+            "direction": s.get("direction", ""),
+            "entry": s.get("entry", 0),
+            "price": s.get("entry", 0),
+            "sl": s.get("sl", 0),
+            "tp1": s.get("tp1", 0),
+            "score": s.get("score", 0),
+            "trend": "NEUTRAL",
+            "time": t or "N/A",
+            "result": s.get("result"),
+            "profit_pct": s.get("profit_pct"),
         })
-    
-    return jsonify(positions)
+    seen_ids = set()
+    merged = []
+    for item in live + list(reversed(tracked)):
+        key = (item.get("asset"), item.get("time"), item.get("entry"))
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        merged.append(item)
+    merged.sort(key=lambda x: (x.get("time", ""), x.get("asset", "")), reverse=True)
+    return jsonify(merged[:50])
 
 @app.route('/api/bot/status')
 def api_bot_status():
@@ -12961,6 +13230,28 @@ QUANT_HTML = """
                 const data = await response.json();
                 
                 document.getElementById('loading').style.display = 'none';
+                
+                if (!response.ok && data.error) {
+                    document.getElementById('assets').innerHTML = 
+                        '<div class="asset-card" style="grid-column: 1/-1;"><p style="color: #ff4466;">Klaida: ' + (data.error || response.status) + '</p></div>';
+                    document.getElementById('assets').style.display = 'grid';
+                    return;
+                }
+                if (data.enabled === false) {
+                    document.getElementById('assets').innerHTML = 
+                        '<div class="asset-card" style="grid-column: 1/-1;"><p style="color: #ffd700; font-size: 1.2em;">Quant analizė išjungta.</p>' +
+                        '<p style="color: #888; margin-top: 10px;">Įjunk config.py arba futures_signals.py: QUANT_ENABLED = True</p></div>';
+                    document.getElementById('assets').style.display = 'grid';
+                    return;
+                }
+                if (data.error) {
+                    document.getElementById('assets').innerHTML = 
+                        '<div class="asset-card" style="grid-column: 1/-1;"><p style="color: #ff4466;">Klaida: ' + data.error + '</p>' +
+                        '<p style="color: #888; margin-top: 10px;">Bandyk perkrauti puslapį arba paleisk analizę vėliau.</p></div>';
+                    document.getElementById('assets').style.display = 'grid';
+                    return;
+                }
+                
                 document.getElementById('assets').style.display = 'grid';
                 
                 if (data.last_update) {
@@ -12971,7 +13262,13 @@ QUANT_HTML = """
                 const assetsDiv = document.getElementById('assets');
                 assetsDiv.innerHTML = '';
                 
-                for (const [asset, info] of Object.entries(data.assets)) {
+                const assetsData = data.assets || {};
+                if (Object.keys(assetsData).length === 0) {
+                    assetsDiv.innerHTML = '<div class="asset-card" style="grid-column: 1/-1;"><p style="color: #888;">Duomenų nėra. Paleisk botą ir palauk ~30s kol analizė suskaičiuos.</p></div>';
+                    return;
+                }
+                
+                for (const [asset, info] of Object.entries(assetsData)) {
                     const biasClass = info.signal_bias > 0 ? 'bias-positive' : 
                                      info.signal_bias < 0 ? 'bias-negative' : 'bias-neutral';
                     

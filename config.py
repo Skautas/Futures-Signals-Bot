@@ -2,6 +2,16 @@
 Centralizuota konfigūracija
 """
 
+# KRAKEN OBSERVER MODE (read-only, no auto-trading)
+# When True: bot fetches positions, balance, tracks manual trades, records statistics
+# Bot NEVER places orders - only observes and collects data
+KRAKEN_OBSERVER_MODE = True
+
+# TRAILING STOP ON EXCHANGE
+# When True: bot places and updates SL orders on Kraken for trailing stop management
+# Works in Observer mode - enables trailing for manually opened positions
+TRAILING_STOP_ON_EXCHANGE = True
+
 # PROFIT MODE
 PROFIT_MODE_ENABLED = True
 PROFIT_DAILY_TARGET_EUR = 15.0
@@ -30,3 +40,16 @@ TRADING_HOURS_ENABLED = False  # Išjungta testavimui
 # ZONE RESOLUTION
 ZONE_RESOLUTION_MIN_BODY_PCT = 0.6
 ZONE_RESOLUTION_REQUIRED_CLOSES = 2
+
+# ENTRY RELAXATION (more signals, higher risk)
+# RANGE: allow entries without zone confirmation when price is OUTSIDE any zone
+RANGE_ALLOW_OUTSIDE_ZONE = True
+# Zone NEAR: block when confidence >= this (per mode: SWING 65, CASHFLOW 80)
+ZONE_NEAR_BLOCK_CONFIDENCE = {
+    "SWING": 65,
+    "CASHFLOW": 80,
+}
+# Fake breakout: minimum score to confirm (5=strict, 4=more entries)
+FAKE_BREAKOUT_MIN_SCORE = 4
+# Zone resolution: softer body req for breakout (0.6=strict, 0.5=more confirms)
+ZONE_RESOLUTION_RELAXED_BODY_PCT = 0.5
