@@ -187,7 +187,7 @@ from ta.trend import ADXIndicator, EMAIndicator, MACD
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 from telegram import Bot
-from flask import Flask, jsonify, render_template_string, render_template, send_from_directory, Response, request
+from flask import Flask, jsonify, render_template_string, render_template, send_from_directory, Response, request, redirect, url_for
 import threading
 import qrcode
 import io
@@ -275,6 +275,7 @@ from config import (
     ZONE_RESOLUTION_RELAXED_BODY_PCT,
     KRAKEN_OBSERVER_MODE,
     TRAILING_STOP_ON_EXCHANGE,
+    TRAILING_MODEL,
 )
 try:
     from xgboost_trading import XGBoostTradingEngine, XGBoostConfig
@@ -364,11 +365,10 @@ ADX_STRONG = 30
 BREAKOUT_LOOKBACK = 20    # Periods to find support/resistance
 BREAKOUT_THRESHOLD = 0.002  # 0.2% breakout confirmation
 
-# Trailing Stop Settings
+# Trailing Stop Settings (overridden by TRAILING_MODEL in config.py per CASHFLOW/SWING)
 TRAILING_ENABLED = True
-TRAILING_DISTANCE_PCT = 1.5   # Trailing stop distance from current price (%)
-BREAKEVEN_AT_TP1 = True       # Move SL to entry when TP1 is hit
-TRAILING_ACTIVATION_PCT = 1.0 # Activate trailing after 1% profit
+TRAILING_DISTANCE_PCT = 1.5   # Fallback if TRAILING_MODEL not used
+BREAKEVEN_AT_TP1 = True       # Fallback; TRAILING_MODEL.breakeven_at controls per mode
 
 # ================================
 # PARTIAL TAKE PROFIT SETTINGS (v8.4)
@@ -3758,6 +3758,7 @@ async def load_existing_positions_for_trailing():
                 "last_update": datetime.now(timezone.utc),
                 "last_notified_sl": sl,
                 "from_kraken": True,
+                "trade_mode": TRADE_MODE,  # Use global mode for Kraken-imported positions
             }
             
             asset_name = ASSET_NAMES.get(symbol, symbol)
@@ -4006,7 +4007,8 @@ async def sync_positions_with_kraken():
                     "last_notified_sl": sl,
                     "from_kraken": True,
                     "manual_entry": True,
-                    "strategy_name": "TREND_CONTINUATION",  # Default for manual entries
+                    "strategy_name": "TREND_CONTINUATION",
+                    "trade_mode": TRADE_MODE,
                 }
                 
                 asset_name = ASSET_NAMES.get(symbol, symbol)
@@ -4114,11 +4116,42 @@ def auto_mark_signal_result(position, close_reason, current_price):
     mark_signal_result(signal_id, result, profit_pct)
     print(f"  → Auto-marked: {signal_id} = {result} ({profit_pct:+.2f}%)")
 
-def calculate_trailing_sl(position, current_price):
-    """Calculate new trailing stop level"""
+def _get_trailing_model(mode):
+    """Get trailing model config for trade mode. Fallback to CASHFLOW if unknown."""
+    cfg = TRAILING_MODEL.get(mode, TRAILING_MODEL.get("CASHFLOW", {}))
+    return cfg or TRAILING_MODEL["CASHFLOW"]
+
+
+def _get_trailing_distance_pct(position, current_price, model):
+    """Trailing distance % - CASHFLOW: dynamic 0.8-1.2%, SWING: fixed 2.5-3.5%"""
     direction = position['direction']
-    trailing_distance = current_price * (TRAILING_DISTANCE_PCT / 100)
-    
+    entry = position['entry_price']
+    if direction == "LONG":
+        profit_pct = ((current_price - entry) / entry) * 100
+    else:
+        profit_pct = ((entry - current_price) / entry) * 100
+
+    if "activation_at" in model and model["activation_at"] == "TP2":
+        return model.get("distance_pct", 3.0)
+    # CASHFLOW: dynamic 0.8-1.2% based on profit
+    dmin = model.get("distance_min", 0.8)
+    dmax = model.get("distance_max", 1.2)
+    act = model.get("activation_pct", 0.9)
+    if profit_pct <= act:
+        return dmin
+    # Linear: more profit = slightly wider trail
+    t = min(1.0, (profit_pct - act) / 2.0)
+    return dmin + (dmax - dmin) * t
+
+
+def calculate_trailing_sl(position, current_price):
+    """Calculate new trailing stop level. Uses TRAILING_MODEL (CASHFLOW/SWING)."""
+    mode = position.get("trade_mode", TRADE_MODE)
+    model = _get_trailing_model(mode)
+    direction = position['direction']
+    distance_pct = _get_trailing_distance_pct(position, current_price, model)
+    trailing_distance = current_price * (distance_pct / 100)
+
     if direction == "LONG":
         new_sl = current_price - trailing_distance
         if new_sl > position['current_sl']:
@@ -4127,7 +4160,7 @@ def calculate_trailing_sl(position, current_price):
         new_sl = current_price + trailing_distance
         if new_sl < position['current_sl']:
             return new_sl
-    
+
     return None  # No update needed
 
 def check_position_status(position, current_price):
@@ -4160,38 +4193,52 @@ def check_position_status(position, current_price):
         if not position['tp1_hit'] and current_price >= position['tp1']:
             updates['tp1_hit'] = True
             position['tp1_hit'] = True
-            
-            # Activate breakeven
-            if BREAKEVEN_AT_TP1 and not position['breakeven_active']:
-                position['current_sl'] = entry
+
+            model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+            be_at = model.get("breakeven_at", "TP1")
+            be_buffer = model.get("breakeven_buffer_pct", 0.0) / 100.0
+
+            if (BREAKEVEN_AT_TP1 or be_at in ("TP1", "TP1_BUFFERED")) and not position['breakeven_active']:
+                if be_at == "TP1_BUFFERED" and be_buffer > 0:
+                    position['current_sl'] = entry * (1 + be_buffer)
+                else:
+                    position['current_sl'] = entry
                 position['breakeven_active'] = True
                 updates['breakeven_update'] = True
-        
+
         if not position['tp2_hit'] and current_price >= position['tp2']:
             updates['tp2_hit'] = True
             position['tp2_hit'] = True
-        
+
         if current_price >= position['tp3']:
             updates['tp3_hit'] = True
             updates['closed'] = True
             updates['close_reason'] = "TP3_HIT"
-        
+
         # Check SL hit
         if current_price <= position['current_sl']:
             updates['sl_hit'] = True
             updates['closed'] = True
             updates['close_reason'] = "SL_HIT"
-        
-        # Check trailing activation and update
-        if TRAILING_ENABLED and profit_pct >= TRAILING_ACTIVATION_PCT:
+
+        # Check trailing activation and update (CASHFLOW vs SWING)
+        model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+        activate_now = False
+        if model.get("activation_at") == "TP2":
+            activate_now = position['tp2_hit']
+        else:
+            act_pct = model.get("activation_pct", 0.9)
+            activate_now = profit_pct >= act_pct
+
+        if TRAILING_ENABLED and activate_now:
             if not position['trailing_active']:
                 position['trailing_active'] = True
-            
+
             new_sl = calculate_trailing_sl(position, current_price)
             if new_sl:
                 updates['trailing_update'] = new_sl
                 position['current_sl'] = new_sl
-                
+
     else:  # SHORT
         profit_pct = ((entry - current_price) / entry) * 100
         
@@ -4203,38 +4250,52 @@ def check_position_status(position, current_price):
         if not position['tp1_hit'] and current_price <= position['tp1']:
             updates['tp1_hit'] = True
             position['tp1_hit'] = True
-            
-            # Activate breakeven
-            if BREAKEVEN_AT_TP1 and not position['breakeven_active']:
-                position['current_sl'] = entry
+
+            model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+            be_at = model.get("breakeven_at", "TP1")
+            be_buffer = model.get("breakeven_buffer_pct", 0.0) / 100.0
+
+            if (BREAKEVEN_AT_TP1 or be_at in ("TP1", "TP1_BUFFERED")) and not position['breakeven_active']:
+                if be_at == "TP1_BUFFERED" and be_buffer > 0:
+                    position['current_sl'] = entry * (1 - be_buffer)
+                else:
+                    position['current_sl'] = entry
                 position['breakeven_active'] = True
                 updates['breakeven_update'] = True
-        
+
         if not position['tp2_hit'] and current_price <= position['tp2']:
             updates['tp2_hit'] = True
             position['tp2_hit'] = True
-        
+
         if current_price <= position['tp3']:
             updates['tp3_hit'] = True
             updates['closed'] = True
             updates['close_reason'] = "TP3_HIT"
-        
+
         # Check SL hit
         if current_price >= position['current_sl']:
             updates['sl_hit'] = True
             updates['closed'] = True
             updates['close_reason'] = "SL_HIT"
-        
-        # Check trailing activation and update
-        if TRAILING_ENABLED and profit_pct >= TRAILING_ACTIVATION_PCT:
+
+        # Check trailing activation and update (CASHFLOW vs SWING)
+        model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+        activate_now = False
+        if model.get("activation_at") == "TP2":
+            activate_now = position['tp2_hit']
+        else:
+            act_pct = model.get("activation_pct", 0.9)
+            activate_now = profit_pct >= act_pct
+
+        if TRAILING_ENABLED and activate_now:
             if not position['trailing_active']:
                 position['trailing_active'] = True
-            
+
             new_sl = calculate_trailing_sl(position, current_price)
             if new_sl:
                 updates['trailing_update'] = new_sl
                 position['current_sl'] = new_sl
-    
+
     position['last_update'] = datetime.now(timezone.utc)
     return updates
 
@@ -8500,6 +8561,38 @@ def calculate_hold_time(signal: dict) -> dict:
 # ================================
 # TELEGRAM NOTIFICATIONS
 # ================================
+def telegram_mode_tag(trade_mode):
+    """🧭 MODE tag for Telegram signal messages"""
+    return "🧭 MODE: CASHFLOW" if trade_mode == "CASHFLOW" else "🧭 MODE: SWING"
+
+def telegram_trailing_tag(trade_mode):
+    """🔁 TRAILING tag for Telegram signal messages"""
+    if trade_mode == "CASHFLOW":
+        return "🔁 TRAILING: CASHFLOW (Aggressive)"
+    return "🔁 TRAILING: SWING (Structure-based)"
+
+def zone_confidence_badge(conf):
+    """🏷️ Zone confidence badge: 80+ Strong, 60-79 Medium, 40-59 Weak, 0-39 None"""
+    if conf is None:
+        return "🏷️ ZONE CONFIDENCE: N/A ⚪ None"
+    conf = int(conf)
+    if conf >= 80:
+        return f"🏷️ ZONE CONFIDENCE: {conf}% 🟢 Strong"
+    elif conf >= 60:
+        return f"🏷️ ZONE CONFIDENCE: {conf}% 🟡 Medium"
+    elif conf >= 40:
+        return f"🏷️ ZONE CONFIDENCE: {conf}% 🟠 Weak"
+    else:
+        return f"🏷️ ZONE CONFIDENCE: {conf}% ⚪ None"
+
+def zone_confidence_bar(conf):
+    """🏷️ Zone confidence visual bar (10 segments)"""
+    if conf is None:
+        return "🏷️ ZONE: N/A ░░░░░░░░░░"
+    conf = int(conf)
+    filled = min(10, max(0, int(conf / 10)))
+    return f"🏷️ ZONE: {conf}% " + "▓" * filled + "░" * (10 - filled)
+
 async def send_telegram_signal(signal):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Telegram not configured")
@@ -8548,14 +8641,29 @@ async def send_telegram_signal(signal):
         if context_parts:
             context_line = f"Context: {context_line}"
 
-        message = (
-            f"{'🟢' if mode_label == 'CASHFLOW' else '🔵'} {mode_label} | {asset_name} (Perp) | {signal['direction']}\n"
-            f"Score: {signal['score']}/100 | Conf: {confidence*100:.0f}%\n\n"
-            f"Entry: {signal['price']:.2f}\n"
-            f"SL: {signal['sl']:.2f}\n"
-            f"TP1: {signal['tp1']:.2f}  TP2: {signal['tp2']:.2f}  TP3: {signal['tp3']:.2f}\n\n"
-            f"{context_line}"
-        )
+        mode_tag = telegram_mode_tag(trade_mode)
+        trailing_tag = telegram_trailing_tag(trade_mode)
+        zone_conf = signal.get("zone_confidence")
+        zone_line = zone_confidence_badge(zone_conf) if zone_conf is not None else ""
+
+        msg_lines = [
+            f"{'🟢' if mode_label == 'CASHFLOW' else '🔵'} {mode_label} | {asset_name} (Perp) | {signal['direction']}",
+            f"Score: {signal['score']}/100 | Conf: {confidence*100:.0f}%",
+            "",
+            mode_tag,
+            trailing_tag,
+        ]
+        if zone_line:
+            msg_lines.extend(["", zone_line])
+        msg_lines.extend([
+            "",
+            f"Entry: {signal['price']:.2f}",
+            f"SL: {signal['sl']:.2f}",
+            f"TP1: {signal['tp1']:.2f}  TP2: {signal['tp2']:.2f}  TP3: {signal['tp3']:.2f}",
+            "",
+            context_line,
+        ])
+        message = "\n".join(msg_lines)
         
         sent = await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
         telegram_stats["last_send"] = datetime.now(timezone.utc).isoformat()
@@ -8591,12 +8699,20 @@ async def send_telegram_auto_trade(signal, trade_result, action="OPEN"):
             leverage = trade_result.get('leverage', LEVERAGE)
             leverage_tier = trade_result.get('leverage_tier', 'FIXED')
             tier_emoji = {"STRONG": "💪", "MEDIUM": "✊", "WEAK": "👌", "MINIMAL": "☝️", "FIXED": "🔒"}.get(leverage_tier, "📊")
+            trade_mode = signal.get("mode", TRADE_MODE)
+            mode_tag = telegram_mode_tag(trade_mode)
+            trailing_tag = telegram_trailing_tag(trade_mode)
+            zone_conf = signal.get("zone_confidence")
+            zone_line = f"\n{zone_confidence_badge(zone_conf)}" if zone_conf is not None else ""
             message = f"""
 🤖 <b>AUTO-TRADE EXECUTED</b> 🤖
 
 {direction_emoji} <b>{asset_name} {signal['direction']}</b>
 {tier_emoji} <b>Leverage:</b> {leverage}x ({leverage_tier})
 <b>Size:</b> ${trade_result.get('size', 0) * trade_result['price']:.2f}
+
+{mode_tag}
+{trailing_tag}{zone_line}
 
 💰 <b>Pozicija atidaryta:</b>
 <b>Entry:</b> ${trade_result['price']:.2f}
@@ -10744,10 +10860,15 @@ async def signal_loop():
     print(f"💰 Daily Loss Limit: -{DAILY_LOSS_LIMIT_PCT}% (${DAILY_LOSS_LIMIT_USD} fallback)")
     print(f"📊 Weekly Loss Limit: -{WEEKLY_LOSS_LIMIT_PCT}%")
     print(f"📉 Maximum Drawdown: -{MAX_DRAWDOWN_PCT}% from peak equity")
-    print(f"📈 Trailing Stop: {'ENABLED' if TRAILING_ENABLED else 'DISABLED'} ({TRAILING_DISTANCE_PCT}%)")
+    print(f"📈 Trailing Stop: {'ENABLED' if TRAILING_ENABLED else 'DISABLED'}")
+    if TRAILING_ENABLED:
+        cfg = TRAILING_MODEL.get(TRADE_MODE, TRAILING_MODEL.get("CASHFLOW", {}))
+        if cfg.get("activation_at") == "TP2":
+            print(f"   🟢 Mode: {TRADE_MODE} | Trailing after TP2 | Distance: {cfg.get('distance_pct', 3.0)}%")
+        else:
+            print(f"   🟢 Mode: {TRADE_MODE} | Activate @ {cfg.get('activation_pct', 0.9)}% | Distance: {cfg.get('distance_min', 0.8)}-{cfg.get('distance_max', 1.2)}%")
     if TRAILING_ENABLED and TRAILING_STOP_ON_EXCHANGE and POSITION_TRACKING_ENABLED:
         print(f"🛡️ Trailing on Kraken: ON (SL orders placed & updated on exchange)")
-    print(f"🛡️ Breakeven at TP1: {'YES' if BREAKEVEN_AT_TP1 else 'NO'}")
     print(f"🤖 Partial TP: {'ON - Auto-close 33% at TP1 & TP2' if PARTIAL_TP_ENABLED else 'OFF'}")
     print(f"🏛️ FOMC Filter: {'ON' if FOMC_BLACKOUT_ENABLED else 'OFF'}")
     print(f"📉 Market Regime: {'ON' if MARKET_REGIME_ENABLED else 'OFF'}")
@@ -11177,6 +11298,16 @@ DASHBOARD_HTML = """
 </html>
 """
 
+@app.route('/favicon.ico')
+def favicon():
+    """Tuščias favicon – vengti 404 mobiliuose naršyklėse"""
+    return Response(b'', status=204, mimetype='image/x-icon')
+
+@app.errorhandler(404)
+def not_found(e):
+    """Nežinomi URL nukreipiami į pagrindinį dashboard"""
+    return redirect(url_for('dashboard'))
+
 @app.route('/')
 def dashboard():
     uptime = datetime.now(timezone.utc) - bot_stats["start_time"]
@@ -11425,14 +11556,45 @@ def api_balance():
         "last_update": balance["last_update"].isoformat() if balance["last_update"] else None,
     })
 
-@app.route('/qr')
-def qr_code_image():
-    """Generuoti QR kodą PWA diegimui"""
+def _get_dashboard_url(use_request_host=False):
+    """Gauti dashboard URL – Replit, arba lokalus IP (Android / kiti įrenginiai WiFi)"""
     domain = os.getenv("REPLIT_DEV_DOMAIN", "")
     if domain:
-        url = f"https://{domain}"
-    else:
-        url = "https://futures-signals.replit.app"
+        return f"https://{domain}"
+    # Jei užkrovimo metu naudotas LAN IP – naudoti tą patį (patikimiau)
+    if use_request_host:
+        try:
+            host = request.host
+            if host and "127.0.0.1" not in host and "localhost" not in host:
+                return f"http://{host}"
+        except Exception:
+            pass
+    # Lokalus režimas: nustatyti LAN IP
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return f"http://{local_ip}:5000"
+    except Exception:
+        pass
+    try:
+        import socket
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        if local_ip and not local_ip.startswith("127."):
+            return f"http://{local_ip}:5000"
+    except Exception:
+        pass
+    return "http://127.0.0.1:5000"
+
+
+@app.route('/qr')
+def qr_code_image():
+    """Generuoti QR kodą – skenuokite Android, kad atsidarytų dashboard"""
+    url = _get_dashboard_url(use_request_host=True)
     
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
     qr.add_data(url)
@@ -11447,12 +11609,16 @@ def qr_code_image():
 
 @app.route('/share')
 def share_page():
-    """PWA dalinimosi puslapis su QR kodu"""
-    domain = os.getenv("REPLIT_DEV_DOMAIN", "")
-    if domain:
-        url = f"https://{domain}"
-    else:
-        url = "https://futures-signals.replit.app"
+    """Puslapis su QR kodu – skenuokite Android, kad atsidarytų dashboard"""
+    url = _get_dashboard_url(use_request_host=True)
+    bad_url_warning = ""
+    if "127.0.0.1" in url or "localhost" in url:
+        bad_url_warning = '''
+        <div class="warning-box" style="background:#ff446620;border:1px solid #ff4466;border-radius:10px;padding:15px;margin-bottom:20px;color:#ff4466;">
+            ⚠️ <b>Telefonas nepasieks per šį adresą!</b><br>
+            Atidarykite šį puslapį per <b>kompiuterio LAN IP</b> (pvz. http://192.168.1.x:5000/share). 
+            Paleiskite "ipconfig" arba "ip addr" ir naudokite IPv4 adresą.
+        </div>'''
     
     share_html = '''
 <!DOCTYPE html>
@@ -11576,24 +11742,28 @@ def share_page():
         </div>
         
         <div class="url-box">''' + url + '''</div>
-        
+        ''' + bad_url_warning + '''
         <div class="instructions">
-            <h3>📱 Kaip Įdiegti</h3>
+            <h3>📱 Kaip naudoti Android</h3>
             <div class="step">
                 <span class="step-num">1</span>
-                <span class="step-text">Nuskaitykite QR kodą telefono kamera</span>
+                <span class="step-text"><b>Telefonas turi būti tame pačiame WiFi</b> kaip kompiuteris</span>
             </div>
             <div class="step">
                 <span class="step-num">2</span>
-                <span class="step-text"><b>Android:</b> Spauskite "Įdiegti" arba "Add to Home Screen"</span>
+                <span class="step-text">Nuskaitykite QR kodą telefono kamera (arba įveskite URL viršuje)</span>
             </div>
             <div class="step">
                 <span class="step-num">3</span>
-                <span class="step-text"><b>iPhone:</b> Share ➜ "Add to Home Screen"</span>
+                <span class="step-text">Naršyklė atsidarys – matysite dashboard</span>
             </div>
             <div class="step">
                 <span class="step-num">4</span>
-                <span class="step-text">Programa bus įdiegta kaip native app!</span>
+                <span class="step-text">(Neprivaloma) Android: Chrome meniu → "Add to Home screen" – kaip programėlė</span>
+            </div>
+            <div class="step">
+                <span class="step-num">5</span>
+                <span class="step-text">Jei "Not Found" arba nesijungia: Windows Firewall → leiskite Python per portą 5000</span>
             </div>
         </div>
         

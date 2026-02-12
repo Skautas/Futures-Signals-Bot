@@ -12,6 +12,25 @@ KRAKEN_OBSERVER_MODE = True
 # Works in Observer mode - enables trailing for manually opened positions
 TRAILING_STOP_ON_EXCHANGE = True
 
+# TRAILING MODELS (CASHFLOW vs SWING) - must match TRADE_MODE in futures_signals.py
+# CASHFLOW: greitas pinigų paėmimas, agresyvus trailing
+# SWING: leidžiam rinkai dirbti, trailing tik po TP2
+TRAILING_MODEL = {
+    "CASHFLOW": {
+        "activation_pct": 0.9,      # Activate trailing after 0.9% profit (0.8-1.0)
+        "distance_min": 0.8,         # Min trail distance %
+        "distance_max": 1.2,         # Max trail distance % (dynamic: more profit = wider)
+        "breakeven_at": "TP1",       # Breakeven immediately when TP1 hit
+        "breakeven_buffer_pct": 0.0, # No buffer for CASHFLOW
+    },
+    "SWING": {
+        "activation_at": "TP2",      # Trailing ONLY after TP2 is hit
+        "distance_pct": 3.0,         # 2.5-3.5% trail distance
+        "breakeven_at": "TP1_BUFFERED",
+        "breakeven_buffer_pct": 0.2, # Entry + 0.2% buffer when TP1 hit
+    },
+}
+
 # PROFIT MODE
 PROFIT_MODE_ENABLED = True
 PROFIT_DAILY_TARGET_EUR = 15.0
