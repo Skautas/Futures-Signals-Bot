@@ -1,3 +1,5 @@
+from enum import Enum
+
 from bot.market_state import MarketState
 from bot.zone_resolution import ZoneResolutionState
 from bot.location import Location, location_block
@@ -7,23 +9,165 @@ from bot.expansion_filter import expansion_bias_block
 from zone_gate import zone_gate_decision
 
 try:
-    from config import RANGE_ALLOW_OUTSIDE_ZONE
+    from config import (
+        ZONE_NEAR_BLOCK_CONFIDENCE_V2,
+        ZONE_SOFT_ALLOW_CONFIDENCE,
+        RANGE_MIN_FINAL_SCORE,
+        RANGE_ALLOW_OUTSIDE_ZONE,
+        RSI_SHORT_BLOCK,
+        RSI_LONG_BLOCK,
+    )
 except ImportError:
-    RANGE_ALLOW_OUTSIDE_ZONE = False
+    ZONE_NEAR_BLOCK_CONFIDENCE_V2 = 75
+    ZONE_SOFT_ALLOW_CONFIDENCE = 40
+    RANGE_MIN_FINAL_SCORE = 72
+    RANGE_ALLOW_OUTSIDE_ZONE = True
+    RSI_SHORT_BLOCK = 25
+    RSI_LONG_BLOCK = 75
 
 
-def direction_gate(market_state):
+class Decision(Enum):
+    ALLOW = "ALLOW"
+    BLOCK = "BLOCK"
+
+
+def decision_engine(ctx):
+    """
+    ctx privalo turėti:
+    - direction: LONG / SHORT
+    - mode: CASHFLOW / SWING
+    - market_state: BULL / BEAR / RANGE / STRONG_BEAR / STRONG_BULL (str arba MarketState)
+    - rsi
+    - final_score (mutable – nuobaudos keičia ctx.final_score)
+    - zone_state: INSIDE / NEAR / OUTSIDE
+    - zone_confidence: int 0–100
+    - zone_breakout_confirmed: bool
+    - fake_breakout_ok: bool
+
+    Grąžina: (Decision.ALLOW | Decision.BLOCK, reason_str)
+    """
+    # Normalize market_state to string
+    ms = getattr(ctx.market_state, "name", None) or getattr(ctx.market_state, "value", None) or str(ctx.market_state)
+
+    # --------------------------------------------------
+    # 1. RSI VETO (ABSOLIUTUS)
+    # --------------------------------------------------
+    if ctx.direction == "SHORT" and ctx.rsi is not None and ctx.rsi <= RSI_SHORT_BLOCK:
+        return Decision.BLOCK, "RSI_OVERSOLD"
+
+    if ctx.direction == "LONG" and ctx.rsi is not None and ctx.rsi >= RSI_LONG_BLOCK:
+        return Decision.BLOCK, "RSI_OVERBOUGHT"
+
+    # --------------------------------------------------
+    # 2. MARKET STATE GATE (SOFT)
+    # --------------------------------------------------
+    if ms in ("BEAR", "STRONG_BEAR") and ctx.direction == "LONG":
+        if ctx.mode == "SWING":
+            return Decision.BLOCK, "MARKET_STATE_LONG_DISABLED"
+        ctx.final_score -= 20
+
+    if ms in ("BULL", "STRONG_BULL") and ctx.direction == "SHORT":
+        if ctx.mode == "SWING":
+            return Decision.BLOCK, "MARKET_STATE_SHORT_DISABLED"
+        ctx.final_score -= 20
+
+    # --------------------------------------------------
+    # 3. ZONE POSITION LOGIC
+    # --------------------------------------------------
+    zone_state = getattr(ctx, "zone_state", None) or "OUTSIDE"
+    zone_conf = getattr(ctx, "zone_confidence", 0) or 0
+
+    if zone_state == "INSIDE":
+        return Decision.BLOCK, "PRICE_INSIDE_ZONE"
+
+    if zone_state == "NEAR":
+        if zone_conf >= ZONE_NEAR_BLOCK_CONFIDENCE_V2:
+            return Decision.BLOCK, "STRONG_ZONE_NEAR"
+        ctx.final_score -= 10  # SOFT penalty
+
+    # --------------------------------------------------
+    # 4. SUPPLY / DEMAND BREAKOUT GATE
+    # --------------------------------------------------
+    breakout_ok = getattr(ctx, "zone_breakout_confirmed", False)
+
+    if ctx.direction == "LONG" and not breakout_ok:
+        if ctx.mode == "SWING":
+            return Decision.BLOCK, "NO_SUPPLY_BREAKOUT"
+        ctx.final_score -= 30
+
+    if ctx.direction == "SHORT" and not breakout_ok:
+        if ctx.mode == "SWING":
+            return Decision.BLOCK, "NO_DEMAND_BREAKOUT"
+        ctx.final_score -= 30
+
+    # --------------------------------------------------
+    # 5. FAKE BREAKOUT FILTER
+    # --------------------------------------------------
+    fake_ok = getattr(ctx, "fake_breakout_ok", True)
+    if not fake_ok:
+        if ctx.mode == "SWING":
+            return Decision.BLOCK, "NO_FAKE_BREAKOUT"
+        ctx.final_score -= 15
+
+    # --------------------------------------------------
+    # 6. RANGE MODE SPECIAL LOGIC
+    # --------------------------------------------------
+    if ms == "RANGE":
+        if zone_conf < ZONE_SOFT_ALLOW_CONFIDENCE:
+            if not RANGE_ALLOW_OUTSIDE_ZONE:
+                return Decision.BLOCK, "RANGE_REQUIRES_ZONE_CONFIRMATION"
+        ctx.final_score -= 10
+
+    # --------------------------------------------------
+    # 7. FINAL SCORE CHECK
+    # --------------------------------------------------
+    if ctx.final_score < RANGE_MIN_FINAL_SCORE:
+        return Decision.BLOCK, "FINAL_SCORE_TOO_LOW"
+
+    # --------------------------------------------------
+    # 8. ✅ ALLOW SIGNAL
+    # --------------------------------------------------
+    return Decision.ALLOW, "SIGNAL_ACCEPTED"
+
+
+def tp_multiplier(zone_confidence):
+    """
+    TP adaptacija pagal zonos stiprumą.
+    Grąžina: 1.0 | 0.8 | 0.6 | 0.5
+    """
+    if zone_confidence is None:
+        return 0.5
+    if zone_confidence >= 80:
+        return 1.0
+    elif zone_confidence >= 60:
+        return 0.8
+    elif zone_confidence >= 40:
+        return 0.6
+    else:
+        return 0.5
+
+
+def direction_gate(market_state, mode="CASHFLOW"):
+    """SWING=strict (trend only). CASHFLOW=flexible (allows counter-trend)."""
     allow_long = False
     allow_short = False
 
     if market_state == MarketState.STRONG_BEAR:
         allow_short = True
+        if mode == "CASHFLOW":
+            allow_long = True  # CASHFLOW flexible; check_all_filters enforces RSI<35 etc
     elif market_state == MarketState.STRONG_BULL:
         allow_long = True
+        if mode == "CASHFLOW":
+            allow_short = True  # CASHFLOW flexible
     elif market_state == MarketState.BEAR:
         allow_short = True
+        if mode == "CASHFLOW":
+            allow_long = True
     elif market_state == MarketState.BULL:
         allow_long = True
+        if mode == "CASHFLOW":
+            allow_short = True
     elif market_state == MarketState.RANGE:
         allow_long = True
         allow_short = True
@@ -73,7 +217,7 @@ def evaluate_signal(
         else:
             allow_long, allow_short = False, False
     else:
-        allow_long, allow_short = direction_gate(market_state)
+        allow_long, allow_short = direction_gate(market_state, mode)
 
     if signal_direction == "LONG" and not allow_long:
         return False, "BLOCKED: MARKET_STATE_LONG_DISABLED", size_mult, conf_mult, 1.0
@@ -81,15 +225,9 @@ def evaluate_signal(
     if signal_direction == "SHORT" and not allow_short:
         return False, "BLOCKED: MARKET_STATE_SHORT_DISABLED", size_mult, conf_mult, 1.0
 
-    # RANGE: SWING needs zone, CASHFLOW allows if score suffices (checked in main)
-    if market_state == MarketState.RANGE:
-        if mode == "SWING":
-            if not zone_confirmation:
-                if RANGE_ALLOW_OUTSIDE_ZONE and zone_state in ("OUTSIDE", None) and (zone_confidence or 0) < 40:
-                    pass
-                else:
-                    return False, "BLOCKED: RANGE_REQUIRES_ZONE_CONFIRMATION", size_mult, conf_mult, 1.0
-        # CASHFLOW: pass here; RANGE_SCORE_TOO_LOW (score < 72) checked in futures_signals after final_score
+    # RANGE: zone is BONUS, not gate. Score >= 72 allows trade even without zone (checked in futures_signals).
+    # Both CASHFLOW and SWING pass here; RANGE_SCORE_TOO_LOW blocks only when zone_conf<40 AND score<72.
+    # (previously blocked SWING with RANGE_REQUIRES_ZONE_CONFIRMATION)
 
     loc_ok, loc_reason, loc_tp_mod = location_block(
         location, signal_direction, zone_confidence=zone_confidence or 0, mode=mode
@@ -148,7 +286,11 @@ def evaluate_signal(
             else:
                 return False, "BLOCKED: OF_FAKE_BREAKOUT_NEEDS_REJECTION", size_mult, conf_mult, 1.0
         else:
-            return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
+            # NO_FAKE_BREAKOUT: SWING=block; CASHFLOW=WAIT/CONFIRMATION (allow with reduced size)
+            if mode == "SWING":
+                return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
+            size_mult *= 0.6
+            conf_mult *= 0.75
     if location == Location.AT_DEMAND and signal_direction == "LONG":
         if fake_breakout_result and fake_breakout_result.confirmed:
             if mode == "SWING":
@@ -159,7 +301,11 @@ def evaluate_signal(
             else:
                 return False, "BLOCKED: OF_FAKE_BREAKOUT_NEEDS_REJECTION", size_mult, conf_mult, 1.0
         else:
-            return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
+            # NO_FAKE_BREAKOUT: SWING=block; CASHFLOW=WAIT/CONFIRMATION (allow with reduced size)
+            if mode == "SWING":
+                return False, "BLOCKED: NO_FAKE_BREAKOUT", size_mult, conf_mult, 1.0
+            size_mult *= 0.6
+            conf_mult *= 0.75
 
     if mode == "SWING":
         if signal_direction == "LONG" and not breakout_ok:

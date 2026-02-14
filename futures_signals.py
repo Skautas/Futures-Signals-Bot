@@ -230,7 +230,7 @@ from bot.market_state import MarketState, detect_market_state
 from bot.location import Location, location_block
 from bot.breakout import breakout_confirmed
 from bot.indicators import indicator_score
-from bot.decision_engine import evaluate_signal
+from bot.decision_engine import evaluate_signal, decision_engine, Decision, tp_multiplier as decision_tp_multiplier
 from bot.pullback import evaluate_pullback
 from bot.rejection import evaluate_rejection
 from bot.fake_breakout import evaluate_fake_breakout
@@ -276,6 +276,7 @@ from config import (
     KRAKEN_OBSERVER_MODE,
     TRAILING_STOP_ON_EXCHANGE,
     TRAILING_MODEL,
+    USE_DECISION_ENGINE_V2,
 )
 try:
     from xgboost_trading import XGBoostTradingEngine, XGBoostConfig
@@ -381,7 +382,7 @@ PARTIAL_MIN_SIZE_USD = 5.0    # Minimum position size to close (Kraken minimum)
 # ================================
 # AUTO-TRADING SETTINGS (v8.6)
 # ================================
-AUTO_TRADING_ENABLED = False     # Enable automatic position opening/closing
+AUTO_TRADING_ENABLED = True      # Enable automatic position opening/closing on Kraken
 DISABLE_KRAKEN_IN_SIGNAL_ONLY = True  # Skip Kraken balance/positions when signal-only
 AUTO_TRADE_MARGIN_USD = 50         # Initial margin in USD per trade (position = margin × leverage)
 MAX_MARGIN_USD = 50                # Hard cap per-trade margin in USD
@@ -2417,16 +2418,18 @@ async def safe_exchange_call(func, *args, timeout=10, max_retries=3, **kwargs):
     Wrapper for exchange API calls with timeout and retry logic.
     Prevents bot from hanging indefinitely on API failures.
     """
+    # Don't pass timeout/max_retries to the wrapped function (exchange API)
+    call_kwargs = {k: v for k, v in kwargs.items() if k not in ('timeout', 'max_retries')}
     for attempt in range(max_retries):
         try:
             # Use asyncio.wait_for for timeout
             if asyncio.iscoroutinefunction(func):
-                result = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+                result = await asyncio.wait_for(func(*args, **call_kwargs), timeout=timeout)
             else:
                 # Synchronous function - run in executor
                 loop = asyncio.get_event_loop()
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: func(*args, **kwargs)),
+                    loop.run_in_executor(None, lambda: func(*args, **call_kwargs)),
                     timeout=timeout
                 )
             return result
@@ -2961,11 +2964,11 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
         sl_order_id = None
         sl_side = "sell" if direction == "LONG" else "buy"
         try:
-            # Kraken Futures requires 'stop' order type with triggerPrice
+            # Kraken Futures: stop order with triggerPrice in params (ccxt: max 6 args)
+            sl_params = {'triggerPrice': sl, 'reduceOnly': True}
             sl_order = await safe_exchange_call(
                 exchange.create_order,
-                symbol, 'stop', sl_side, position_size, sl, None,
-                {'triggerPrice': sl, 'reduceOnly': True},
+                symbol, 'stop', sl_side, position_size, None, sl_params,
                 timeout=10, max_retries=3
             )
             if sl_order is None:
@@ -3156,6 +3159,7 @@ async def open_position(symbol, direction, price, sl, tp1, tp2, tp3, signal_scor
             "confirmation_count": confirmation_count,
             "entry_type": entry_type,
             "trade_mode": trade_mode,
+            "market_state_at_entry": kwargs.get("market_state"),
             "strategy_name": kwargs.get('strategy_name', 'TREND_CONTINUATION'),  # Strategy identification
             "exit_profile": {
                 "breakeven_after_tp1": exit_levels.breakeven_after_tp1,
@@ -3256,12 +3260,13 @@ async def update_exchange_sl(symbol, new_sl_price, position_size):
                     print(f"     ⚠️ Could not cancel old SL: {cancel_err}")
                     # Continue anyway - new order will replace it
             
-            # Place new SL order (Kraken Futures: type 'stop' with triggerPrice)
+            # Place new SL order (Kraken Futures: stop market with triggerPrice)
+            # ccxt create_order(symbol, type, side, amount, price=None, params={}) – max 6 args
             sl_side = "sell" if direction == "LONG" else "buy"
+            sl_params = {'triggerPrice': new_sl_price, 'reduceOnly': True}
             sl_order = await safe_exchange_call(
                 exchange.create_order,
-                symbol, 'stop', sl_side, remaining_size, new_sl_price, None,
-                {'triggerPrice': new_sl_price, 'reduceOnly': True},
+                symbol, 'stop', sl_side, remaining_size, None, sl_params,
                 timeout=10, max_retries=2
             )
             
@@ -4060,6 +4065,8 @@ def create_position(signal, signal_id=None, size=0):
         "symbol": signal['symbol'],
         "direction": signal['direction'],
         "entry_price": signal['price'],
+        "trade_mode": signal.get("mode", TRADE_MODE),
+        "market_state_at_entry": signal.get("market_state"),
         "size": size,
         "original_size": size,
         "current_sl": signal['sl'],
@@ -4116,10 +4123,17 @@ def auto_mark_signal_result(position, close_reason, current_price):
     mark_signal_result(signal_id, result, profit_pct)
     print(f"  → Auto-marked: {signal_id} = {result} ({profit_pct:+.2f}%)")
 
-def _get_trailing_model(mode):
-    """Get trailing model config for trade mode. Fallback to CASHFLOW if unknown."""
+def _get_trailing_model(mode, position=None):
+    """Get trailing model config for trade mode. CASHFLOW bear long uses aggressive trailing."""
     cfg = TRAILING_MODEL.get(mode, TRAILING_MODEL.get("CASHFLOW", {}))
-    return cfg or TRAILING_MODEL["CASHFLOW"]
+    cfg = cfg or TRAILING_MODEL["CASHFLOW"]
+    # CASHFLOW bear long: use aggressive trailing (earlier activation, tighter trail)
+    if position and mode == "CASHFLOW" and position.get("direction") == "LONG":
+        ms = position.get("market_state_at_entry")
+        if ms in ("BEAR", "STRONG_BEAR"):
+            bear_cfg = TRAILING_MODEL.get("CASHFLOW_BEAR_LONG", cfg)
+            return bear_cfg
+    return cfg
 
 
 def _get_trailing_distance_pct(position, current_price, model):
@@ -4147,7 +4161,7 @@ def _get_trailing_distance_pct(position, current_price, model):
 def calculate_trailing_sl(position, current_price):
     """Calculate new trailing stop level. Uses TRAILING_MODEL (CASHFLOW/SWING)."""
     mode = position.get("trade_mode", TRADE_MODE)
-    model = _get_trailing_model(mode)
+    model = _get_trailing_model(mode, position)
     direction = position['direction']
     distance_pct = _get_trailing_distance_pct(position, current_price, model)
     trailing_distance = current_price * (distance_pct / 100)
@@ -4194,7 +4208,7 @@ def check_position_status(position, current_price):
             updates['tp1_hit'] = True
             position['tp1_hit'] = True
 
-            model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+            model = _get_trailing_model(position.get("trade_mode", TRADE_MODE), position)
             be_at = model.get("breakeven_at", "TP1")
             be_buffer = model.get("breakeven_buffer_pct", 0.0) / 100.0
 
@@ -4215,14 +4229,14 @@ def check_position_status(position, current_price):
             updates['closed'] = True
             updates['close_reason'] = "TP3_HIT"
 
-        # Check SL hit
-        if current_price <= position['current_sl']:
+        # Check SL hit – TP always has priority; never overwrite TP3 with SL
+        if not updates.get('closed') and current_price <= position['current_sl']:
             updates['sl_hit'] = True
             updates['closed'] = True
             updates['close_reason'] = "SL_HIT"
 
         # Check trailing activation and update (CASHFLOW vs SWING)
-        model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+        model = _get_trailing_model(position.get("trade_mode", TRADE_MODE), position)
         activate_now = False
         if model.get("activation_at") == "TP2":
             activate_now = position['tp2_hit']
@@ -4251,7 +4265,7 @@ def check_position_status(position, current_price):
             updates['tp1_hit'] = True
             position['tp1_hit'] = True
 
-            model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+            model = _get_trailing_model(position.get("trade_mode", TRADE_MODE), position)
             be_at = model.get("breakeven_at", "TP1")
             be_buffer = model.get("breakeven_buffer_pct", 0.0) / 100.0
 
@@ -4272,14 +4286,14 @@ def check_position_status(position, current_price):
             updates['closed'] = True
             updates['close_reason'] = "TP3_HIT"
 
-        # Check SL hit
-        if current_price >= position['current_sl']:
+        # Check SL hit – TP always has priority; never overwrite TP3 with SL
+        if not updates.get('closed') and current_price >= position['current_sl']:
             updates['sl_hit'] = True
             updates['closed'] = True
             updates['close_reason'] = "SL_HIT"
 
         # Check trailing activation and update (CASHFLOW vs SWING)
-        model = _get_trailing_model(position.get("trade_mode", TRADE_MODE))
+        model = _get_trailing_model(position.get("trade_mode", TRADE_MODE), position)
         activate_now = False
         if model.get("activation_at") == "TP2":
             activate_now = position['tp2_hit']
@@ -4882,6 +4896,26 @@ def check_all_filters(direction, signal_data=None):
         elif is_strong_confluence:
             # v8.9.19: Allow LONG with strong multi-indicator confluence
             reasons.append(f"CONFLUENCE_BYPASS ({confluence_score})")
+        elif (TRADE_MODE == "CASHFLOW" and market_regime_state.get("longs_blocked", False) and
+              market_regime_state.get("regime", "") in ("BEAR", "STRONG_BEAR")):
+            # CASHFLOW: Allow LONG in BEAR with strict requirements (RSI<35, zone>=40 or momentum, reduced TP)
+            zone_conf = signal_data.get("zone_confidence", 0) if signal_data else 0
+            momentum_shift = (
+                has_bullish_reversal or support_bounce or (confluence_score >= 45)
+            )
+            if rsi_val < 35 and (zone_conf >= 40 or momentum_shift):
+                reasons.append("CASHFLOW_BEAR_LONG")
+                if signal_data:
+                    mult = 0.7  # Reduced TP for bear market longs
+                    price = signal_data.get("price", 0)
+                    if price > 0:
+                        tp1, tp2, tp3 = signal_data.get("tp1", price), signal_data.get("tp2", price), signal_data.get("tp3", price)
+                        signal_data["tp1"] = price + (tp1 - price) * mult
+                        signal_data["tp2"] = price + (tp2 - price) * mult
+                        signal_data["tp3"] = price + (tp3 - price) * mult
+            else:
+                blocked = True
+                reasons.append("BEAR_MARKET")
         else:
             # Market Regime
             if market_regime_state.get("longs_blocked", False):
@@ -8169,9 +8203,10 @@ def generate_entry_signal(
         else:
             effective_final_min = MIN_SCORE
 
-        # RANGE + CASHFLOW: score-based (not hard block). Block only when zone_confidence < 40 AND score < 72.
+        # RANGE: zone is BONUS, not gate. Block only when zone_confidence < 40 AND score < 72.
+        # If final_score >= 72 → ALLOW even without zone (both CASHFLOW and SWING).
         # Bypass: fake_breakout_score >= 4 → ALLOW even without zone
-        if (market_state == MarketState.RANGE and TRADE_MODE == "CASHFLOW"):
+        if market_state == MarketState.RANGE:
             fake_bypass = fake_breakout_result and getattr(fake_breakout_result, "score", 0) >= 4
             if not fake_bypass and (zone_confidence or 0) < 40 and final_score < 72:
                 print(f"  ❌ {symbol}: RANGE zone_conf<40 and score<72 (got {final_score}, zone_conf={zone_confidence})")
@@ -8192,6 +8227,43 @@ def generate_entry_signal(
                 )
                 record_block("RANGE_SCORE")
                 return None
+
+        # DECISION ENGINE ROUTER: V2 tik CASHFLOW. SWING lieka v1.
+        use_v2 = USE_DECISION_ENGINE_V2 and TRADE_MODE == "CASHFLOW"
+        if use_v2:
+            # fake_breakout_ok: at supply short / demand long we need confirmation
+            if (base_direction == "SHORT" and location_enum == Location.AT_SUPPLY) or (base_direction == "LONG" and location_enum == Location.AT_DEMAND):
+                fake_breakout_ok_v2 = bool(fake_breakout_result and fake_breakout_result.confirmed)
+            else:
+                fake_breakout_ok_v2 = True
+
+            from types import SimpleNamespace
+            ctx = SimpleNamespace(
+                direction=base_direction,
+                mode=TRADE_MODE,
+                market_state=market_state,
+                rsi=rsi_val,
+                final_score=float(final_score),
+                zone_state=zone_state or "OUTSIDE",
+                zone_confidence=zone_confidence or 0,
+                zone_breakout_confirmed=breakout_ok,
+                fake_breakout_ok=fake_breakout_ok_v2,
+            )
+            dec, reason = decision_engine(ctx)
+            if dec == Decision.BLOCK:
+                print(f"  ❌ {symbol}: {reason} (V2)")
+                log_decision(
+                    symbol, base_direction, market_state, f"BLOCKED: {reason}",
+                    zone_resolution=zone_resolution_state, zone_reason=zone_resolution_reason,
+                    zone_state=zone_state, zone_confidence=zone_confidence,
+                    zone_confirmation=zone_confirmation, zone_source=zone_source,
+                    approach_direction=approach_direction,
+                    indicator_score=indicator_score_value, indicator_bias=indicator_bias,
+                )
+                record_block("DECISION_ENGINE_V2")
+                return None
+            # V2 accepted: optionally use decision_tp_multiplier for TP scaling
+            decision_tp_mod_v2 = decision_tp_multiplier(zone_confidence)
 
         if final_score >= effective_final_min:
             # v8.9.20: ConsolidationGuard - Block signals in range/consolidation
@@ -8265,7 +8337,10 @@ def generate_entry_signal(
             confidence = max(0.0, min(1.0, confidence * decision_conf_mult * htf_conf_mult))
 
             # CASHFLOW: scale TP by zone (weak zone = lower expectations)
-            zone_tp_mult = tp_multiplier_by_zone(zone_confidence, TRADE_MODE)
+            if use_v2:
+                zone_tp_mult = decision_tp_mod_v2
+            else:
+                zone_tp_mult = tp_multiplier_by_zone(zone_confidence, TRADE_MODE)
             tp_mult = min(decision_tp_mod, zone_tp_mult)
             if tp_mult < 1.0:
                 if base_direction == "LONG":
@@ -8333,6 +8408,11 @@ def generate_entry_signal(
                 "support_distance_pct": support_distance_pct,
                 "has_bullish_reversal": has_bullish_reversal,
                 "time": datetime.now(timezone.utc),
+                "mode": TRADE_MODE,
+                "zone_state": zone_state,
+                "zone_confidence": zone_confidence,
+                "breakout_status": "CONFIRMED" if breakout_ok else "SOFT",
+                "tp_mult": tp_mult if tp_mult < 1.0 else 1.0,
             }
         else:
             holding_time = estimate_holding_time(
@@ -8381,7 +8461,12 @@ def generate_entry_signal(
                     "strategy_name": strategy_name,  # Strategy identification
                     "size_multiplier": size_multiplier,  # Apply decision size multiplier
                     "holding_time": holding_time,
-                    "time": datetime.now(timezone.utc)
+                    "time": datetime.now(timezone.utc),
+                    "mode": TRADE_MODE,
+                    "zone_state": zone_state,
+                    "zone_confidence": zone_confidence,
+                    "breakout_status": "CONFIRMED" if breakout_ok else "SOFT",
+                    "tp_mult": tp_mult if tp_mult < 1.0 else 1.0,
                 }
     
     return signal
@@ -8644,7 +8729,25 @@ async def send_telegram_signal(signal):
         mode_tag = telegram_mode_tag(trade_mode)
         trailing_tag = telegram_trailing_tag(trade_mode)
         zone_conf = signal.get("zone_confidence")
+        zone_state = signal.get("zone_state")
+        breakout_status = signal.get("breakout_status")
+        tp_mult = signal.get("tp_mult")
+        rsi_val = signal.get("rsi")
         zone_line = zone_confidence_badge(zone_conf) if zone_conf is not None else ""
+        # V2-style tags: MODE, ZONE, BREAKOUT, TP_MULT, RSI
+        v2_tags = []
+        v2_tags.append(f"MODE: {mode_label}")
+        if zone_state is not None and zone_conf is not None:
+            v2_tags.append(f"ZONE: {zone_state} (conf: {zone_conf})")
+        elif zone_conf is not None:
+            v2_tags.append(f"ZONE: {zone_conf}%")
+        if breakout_status:
+            v2_tags.append(f"BREAKOUT: {breakout_status}")
+        if tp_mult is not None and tp_mult < 1.0:
+            v2_tags.append(f"TP_MULT: {tp_mult:.1f}x")
+        if rsi_val is not None:
+            v2_tags.append(f"RSI: {rsi_val:.1f}")
+        v2_line = " | ".join(v2_tags) if v2_tags else ""
 
         msg_lines = [
             f"{'🟢' if mode_label == 'CASHFLOW' else '🔵'} {mode_label} | {asset_name} (Perp) | {signal['direction']}",
@@ -8653,7 +8756,9 @@ async def send_telegram_signal(signal):
             mode_tag,
             trailing_tag,
         ]
-        if zone_line:
+        if v2_line:
+            msg_lines.extend(["", v2_line])
+        elif zone_line:
             msg_lines.extend(["", zone_line])
         msg_lines.extend([
             "",
@@ -8978,7 +9083,13 @@ async def manage_open_positions():
             asset_name = ASSET_NAMES.get(symbol, symbol)
             
             # v8.9.24: Deduplication - prevent duplicate notifications
-            # Send notifications for updates (with deduplication flags)
+            # CRITICAL: Update Kraken SL to breakeven IMMEDIATELY when TP1 hit –
+            # otherwise old SL stays on exchange and can execute on a wick (SL instead of TP)
+            if updates['breakeven_update']:
+                remaining_size = position.get('remaining_size', position.get('size', 0))
+                if (TRAILING_STOP_ON_EXCHANGE and POSITION_TRACKING_ENABLED and
+                        remaining_size > 0 and position.get('current_sl')):
+                    await update_exchange_sl(symbol, position['current_sl'], remaining_size)
             if updates['breakeven_update'] and not position.get('breakeven_notified'):
                 await send_position_update(position, "BREAKEVEN", current_price)
                 position['breakeven_notified'] = True
@@ -10246,6 +10357,7 @@ async def check_signals():
                         print(f"  ⚠️ HTF lock error: {e}")
 
                     signal["market_state"] = getattr(market_state, "value", market_state)
+                    signal["mode"] = signal.get("mode", TRADE_MODE)
                     signal["decision_reason"] = decision_reason
                     signal["zone_resolution_state"] = getattr(zone_resolution_state, "value", zone_resolution_state)
                     signal["zone_state"] = zone_state
@@ -10822,7 +10934,9 @@ async def check_signals():
                     scalp_rebound_multiplier=signal.get('scalp_rebound_multiplier', 1.0),
                     strategy_name=signal.get('strategy_name', 'TREND_CONTINUATION'),  # Strategy identification
                     size_multiplier=signal.get('size_multiplier', 1.0),  # Strategy health size multiplier
-                    risk_modifier=signal.get('risk_modifier', 1.0)  # 4H trend context risk modifier
+                    risk_modifier=signal.get('risk_modifier', 1.0),  # 4H trend context risk modifier
+                    trade_mode=signal.get('mode', TRADE_MODE),
+                    market_state=signal.get('market_state'),
                 )
                 
                 if trade_result['success']:
@@ -10847,6 +10961,15 @@ async def signal_loop():
     set_risk_event_logger(log_risk_event)
     
     print("🚀 Futures Signal Bot v8.9.24 PRO Started!")
+    # Send startup notification to Telegram
+    try:
+        await send_telegram_status(
+            "🟢 <b>BOT PALEISTAS</b>\n\n"
+            "Futures Signal Bot veikia.\n"
+            f"Mode: {TRADE_MODE} | Trailing: {'ON' if TRAILING_ENABLED else 'OFF'}"
+        )
+    except Exception:
+        pass
     print("📊 v8.9.24: 5m Entry Optimizer (FUND MODE) - 5m tik pagerina entry, neblokuoja signalų!")
     print(f"📊 Assets: {', '.join(ASSET_NAMES.values())}")
     print(f"⏱️ Timeframes: {TIMEFRAME_MACRO} (macro) | {TIMEFRAME_TREND} (trend) | {TIMEFRAME_ENTRY} (entry) | {TIMEFRAME_5M_OPTIMIZE} (optimize)")

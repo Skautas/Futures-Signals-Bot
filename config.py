@@ -3,9 +3,9 @@ Centralizuota konfigūracija
 """
 
 # KRAKEN OBSERVER MODE (read-only, no auto-trading)
-# When True: bot fetches positions, balance, tracks manual trades, records statistics
-# Bot NEVER places orders - only observes and collects data
-KRAKEN_OBSERVER_MODE = True
+# When True: bot only observes, NEVER places orders
+# When False + AUTO_TRADING_ENABLED: bot places orders on Kraken
+KRAKEN_OBSERVER_MODE = False  # Auto-trading enabled – bot will execute trades
 
 # TRAILING STOP ON EXCHANGE
 # When True: bot places and updates SL orders on Kraken for trailing stop management
@@ -22,6 +22,13 @@ TRAILING_MODEL = {
         "distance_max": 1.2,         # Max trail distance % (dynamic: more profit = wider)
         "breakeven_at": "TP1",       # Breakeven immediately when TP1 hit
         "breakeven_buffer_pct": 0.0, # No buffer for CASHFLOW
+    },
+    "CASHFLOW_BEAR_LONG": {
+        "activation_pct": 0.6,       # Aggressive: activate trailing earlier (0.6%)
+        "distance_min": 0.6,         # Tighter trail (0.6-1.0%)
+        "distance_max": 1.0,
+        "breakeven_at": "TP1",
+        "breakeven_buffer_pct": 0.0,
     },
     "SWING": {
         "activation_at": "TP2",      # Trailing ONLY after TP2 is hit
@@ -72,3 +79,24 @@ ZONE_NEAR_BLOCK_CONFIDENCE = {
 FAKE_BREAKOUT_MIN_SCORE = 4
 # Zone resolution: softer body req for breakout (0.6=strict, 0.5=more confirms)
 ZONE_RESOLUTION_RELAXED_BODY_PCT = 0.5
+
+# === DECISION ENGINE V2 (ctx-based) ===
+ZONE_NEAR_BLOCK_CONFIDENCE_V2 = 75   # virš šios – blokuojam (NEAR)
+ZONE_SOFT_ALLOW_CONFIDENCE = 40      # žemiau – leidžiama CASHFLOW
+
+# RANGE (score-based)
+RANGE_MIN_FINAL_SCORE = 72
+
+# BREAKOUT
+REQUIRED_ZONE_CLOSES = 2
+ZONE_MIN_BODY_PCT = 0.5
+
+# RSI veto (absoliutus)
+RSI_SHORT_BLOCK = 25
+RSI_LONG_BLOCK = 75
+
+# MODE
+TRADE_MODE = "CASHFLOW"  # CASHFLOW | SWING
+
+# Decision Engine router: V2 tik CASHFLOW režime. SWING lieka v1 (1–2 dienos).
+USE_DECISION_ENGINE_V2 = False  # True = CASHFLOW naudoja ctx-based decision_engine
