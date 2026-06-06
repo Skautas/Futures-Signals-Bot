@@ -1,13 +1,10 @@
-# Publikuoja Vidinės Ramybės Mokykla statinę svetainę į GitHub Pages.
+# Kelia tik statinį turinį į šaką gh-pages (be configure-pages / be „GitHub Actions“ šaltinio).
 #
-# SVARBU (vieną kartą, kitaip workflow krenta su „Get Pages site failed“):
-# 1. GitHub → šis repo → Settings → Pages
-# 2. „Build and deployment“ → Source: pasirinkite „GitHub Actions“ (NE „Deploy from a branch“)
-# 3. Išsaugokite
-# 4. Actions → šis workflow → „Re-run all jobs“
+# Po pirmo sėkmingo paleidimo: Settings → Pages → Source: „Deploy from a branch“
+# → Branch: gh-pages → Folder: / (root) → Save.
 #
-# Vieša nuoroda po sėkmės: https://skautas.github.io/Futures-Signals-Bot/
-name: Deploy Vidinė ramybė (Pages)
+# Svetainė: https://skautas.github.io/Futures-Signals-Bot/
+name: Deploy Vidinė ramybė (gh-pages)
 
 on:
   workflow_dispatch:
@@ -19,32 +16,22 @@ on:
       - ".github/workflows/pages-vidine-ramybe.yml"
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
+  group: pages-gh-pages
   cancel-in-progress: false
 
 jobs:
   deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload
-        uses: actions/upload-pages-artifact@v3
+      - name: Publish to gh-pages branch
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          path: docs/vidine-ramybe
-
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4
+          folder: docs/vidine-ramybe
+          branch: gh-pages
+          clean: true

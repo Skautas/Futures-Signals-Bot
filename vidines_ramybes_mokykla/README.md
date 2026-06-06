@@ -32,11 +32,9 @@ Arba tiesiog atidarykite `index.html` failą (navigacija veiks; kai kuriuose nar
 
 ## Vieša nuoroda (GitHub Pages)
 
-Po **push** ir įjungus **GitHub Actions** Pages (**Settings → Pages → Source: GitHub Actions**), svetainė bus šaknyje:
+Po **push** darbo eiga įkelia svetainę į šaką **`gh-pages`**. Tada **vieną kartą** nustatykite Pages: **Settings → Pages → Deploy from a branch → `gh-pages` → / (root)** — žr. `docs/vidine-ramybe/VIESA_NUORODA.md`.
 
 **https://skautas.github.io/Futures-Signals-Bot/**
-
-(Jei naudojate tik „Deploy from branch“ su aplanku **`/docs`**, tada adresas su poaplankiu: `.../vidine-ramybe/` — žr. `docs/vidine-ramybe/VIESA_NUORODA.md`.)
 
 Šaltinis talpinimui: aplankas `docs/vidine-ramybe/`. Sinchronizuokite po pakeitimų:
 

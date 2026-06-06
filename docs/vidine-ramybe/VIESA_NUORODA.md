@@ -1,37 +1,31 @@
 # Vieša nuoroda (GitHub Pages)
 
-## Būtina tvarka (kitaip Actions krenta: „Get Pages site failed“ / Not Found)
+## Kaip veikia dabar
 
-**Pirmiausia** įjunkite Pages su Actions, **tada** leiskite darbo eigą.
+Darbo eiga **Deploy Vidinė ramybė (gh-pages)** nukopijuoja `docs/vidine-ramybe/` į atskirą šaką **`gh-pages`**. Tam **nereikia** „GitHub Actions“ kaip Pages šaltinio ir **nebūna** `Get Pages site failed`.
 
-1. Atidarykite: https://github.com/Skautas/Futures-Signals-Bot/settings/pages  
-2. **Build and deployment** → **Source** → pasirinkite **GitHub Actions** (ne „Deploy from a branch“).  
-3. Spauskite **Save**.  
-4. Eikite į **Actions** → darbo eiga **Deploy Vidinė ramybė (Pages)** → **Re-run all jobs** (arba **Re-run failed jobs**).
+### 1. Palaukite žalios varnelės Actions
 
-Jei 2 žingsnyje paliksite „Deploy from a branch“ arba nieko neišsaugosite, `configure-pages` negaus Pages konfigūracijos ir matysite būtent jūsų ekrano klaidą.
+https://github.com/Skautas/Futures-Signals-Bot/actions  
 
-## Po sėkmės
+Jei workflow dar nebuvo paleistas po paskutinio push — **Actions** → **Deploy Vidinė ramybė (gh-pages)** → **Run workflow**.
 
-Svetainė bus čia (šaknis, be `/vidine-ramybe/`):
+### 2. Vieną kartą: įjunkite Pages iš šakos
+
+1. https://github.com/Skautas/Futures-Signals-Bot/settings/pages  
+2. **Build and deployment** → **Source**: **Deploy from a branch**  
+3. **Branch**: `gh-pages`, aplankas **/ (root)**  
+4. **Save**
+
+### 3. Atidarykite svetainę
 
 **https://skautas.github.io/Futures-Signals-Bot/**
 
-## Rekomenduojama: GitHub Actions
-
-Repozitorijoje yra darbo eiga `.github/workflows/pages-vidine-ramybe.yml`. Ji kelia **`docs/vidine-ramybe/`** turinį į Pages **šaknį**.
-
-> Senesnis kelias **`/vidine-ramybe/`** galioja tik jei Pages šaltinis yra **`/docs` aplankas** (tada šaknis = visas `docs/`). Naudojant Actions, naudokite **šaknies** nuorodą aukščiau.
-
-## Alternatyva: tik branch + `/docs`
-
-Jei norite be Actions: **Source** → „Deploy from a branch“ → `main` → folder **`/docs`**.  
-Tada puslapis bus: **https://skautas.github.io/Futures-Signals-Bot/vidine-ramybe/**  
-(`docs/` šaknyje turi būti `vidine-ramybe/index.html` — jau yra.)
+---
 
 ## Atnaujinimai
 
-Keičiate `vidines_ramybes_mokykla/` → sinchronizuokite į `docs/vidine-ramybe/` ir `git push` (žr. `README.md` šaltinio aplanke).
+Keičiate `vidines_ramybes_mokykla/` → sinchronizuokite į `docs/vidine-ramybe/`, `git push` — workflow vėl atnaujins `gh-pages`.
 
 ## Kita vieta be GitHub
 
