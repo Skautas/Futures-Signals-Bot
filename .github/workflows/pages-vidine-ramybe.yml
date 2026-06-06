@@ -1,6 +1,12 @@
 # Publikuoja Vidinės Ramybės Mokykla statinę svetainę į GitHub Pages.
-# Po push: Settings → Pages → Build: „GitHub Actions“ (ne branch).
-# Vieša nuoroda: https://skautas.github.io/Futures-Signals-Bot/
+#
+# SVARBU (vieną kartą, kitaip workflow krenta su „Get Pages site failed“):
+# 1. GitHub → šis repo → Settings → Pages
+# 2. „Build and deployment“ → Source: pasirinkite „GitHub Actions“ (NE „Deploy from a branch“)
+# 3. Išsaugokite
+# 4. Actions → šis workflow → „Re-run all jobs“
+#
+# Vieša nuoroda po sėkmės: https://skautas.github.io/Futures-Signals-Bot/
 name: Deploy Vidinė ramybė (Pages)
 
 on:

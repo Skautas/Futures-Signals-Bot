@@ -1,17 +1,25 @@
 # Vieša nuoroda (GitHub Pages)
 
-## Rekomenduojama: GitHub Actions
+## Būtina tvarka (kitaip Actions krenta: „Get Pages site failed“ / Not Found)
 
-Repozitorijoje yra darbo eiga `.github/workflows/pages-vidine-ramybe.yml`. Ji kelia **`docs/vidine-ramybe/`** turinį į Pages **šaknį** — svetainė atsivers čia:
+**Pirmiausia** įjunkite Pages su Actions, **tada** leiskite darbo eigą.
+
+1. Atidarykite: https://github.com/Skautas/Futures-Signals-Bot/settings/pages  
+2. **Build and deployment** → **Source** → pasirinkite **GitHub Actions** (ne „Deploy from a branch“).  
+3. Spauskite **Save**.  
+4. Eikite į **Actions** → darbo eiga **Deploy Vidinė ramybė (Pages)** → **Re-run all jobs** (arba **Re-run failed jobs**).
+
+Jei 2 žingsnyje paliksite „Deploy from a branch“ arba nieko neišsaugosite, `configure-pages` negaus Pages konfigūracijos ir matysite būtent jūsų ekrano klaidą.
+
+## Po sėkmės
+
+Svetainė bus čia (šaknis, be `/vidine-ramybe/`):
 
 **https://skautas.github.io/Futures-Signals-Bot/**
 
-### Vieną kartą naršyklėje
+## Rekomenduojama: GitHub Actions
 
-1. Atidarykite: https://github.com/Skautas/Futures-Signals-Bot/settings/pages  
-2. **Build and deployment** → **Source**: pasirinkite **GitHub Actions** (ne „Deploy from a branch“).  
-3. Eikite į **Actions** ir palaukite, kol „Deploy Vidinė ramybė (Pages)“ bus žalias.  
-4. Jei niekas neįsijungė — **Actions** → darbo eiga → **Run workflow**.
+Repozitorijoje yra darbo eiga `.github/workflows/pages-vidine-ramybe.yml`. Ji kelia **`docs/vidine-ramybe/`** turinį į Pages **šaknį**.
 
 > Senesnis kelias **`/vidine-ramybe/`** galioja tik jei Pages šaltinis yra **`/docs` aplankas** (tada šaknis = visas `docs/`). Naudojant Actions, naudokite **šaknies** nuorodą aukščiau.
 
