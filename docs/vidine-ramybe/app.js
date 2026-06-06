@@ -46,16 +46,16 @@
   function sync() {
     var on = !!fsState().active;
     btn.setAttribute("aria-pressed", on ? "true" : "false");
-    btn.textContent = on ? "Išeiti" : "Visas ekranas";
+    btn.textContent = on ? "Išeiti" : "Pilnas ekranas";
     btn.setAttribute(
       "aria-label",
       on
-        ? "Išeiti iš viso ekrano režimo"
-        : "Įjungti viso ekrano režimą patogesniam skaitymui"
+        ? "Išeiti iš pilno ekrano režimo"
+        : "Įjungti pilno ekrano režimą patogesniam skaitymui"
     );
     btn.title = on
-      ? "Išeiti iš viso ekrano (dažnai veikia ir Esc)"
-      : "Visas ekranas — daugiau vietos tekstui ir fonui";
+      ? "Išeiti iš pilno ekrano (dažnai veikia ir Esc)"
+      : "Pilnas ekranas — daugiau vietos tekstui ir fonui";
   }
 
   btn.addEventListener("click", function () {

@@ -38,6 +38,7 @@ Keičiate `vidines_ramybes_mokykla/` → sinchronizuokite į `docs/vidine-ramybe
 
 - Jei `docs/vidine-ramybe/audio/` ar `meditacijos/` yra tik lokaliai (**ne** `git add`), GitHub Pages juose **nebūs** — telefone ir kompiuteryje grotuvai liks tušti arba nuorodos neveiks.
 - Po `git add` + `git commit` + `git push` į `main` darbo eiga vėl įkels visą `docs/vidine-ramybe/` į `gh-pages`.
+- Jei **telefone vis dar senas tekstas ar stiliai** po push: į `index.html` (ir kitus HTML) įrašyti naujesnį `?v=...` prie `styles.css` ir `app.js` nuorodų, vėl commit + push; arba telefone atidaryti svetainę **privačiame lange** / išvalyti talpyklą.
 
 ## Kita vieta be GitHub
 
