@@ -4,6 +4,8 @@ Statinė vieno puslapio svetainė (HTML + CSS + JS), lietuvių kalba.
 
 **Kosminis fonas:** paveikslas `images/cosmic-bg.png` — keiskite šį failą savo versija (rekomenduojama bent ~1920px pločio), kelias CSS faile: `url("images/cosmic-bg.png")`.
 
+**Meditacijos:** MP3 kataloge `audio/` — šeši anglų kalbos įrašai iš [UCLA Mindful](https://www.uclahealth.org/uclamindful/guided-meditations) (CC BY-NC-ND; žr. `audio/ATTRIBUTION.txt`). Ilgos praktikos **lietuviškas tekstas** — `meditacijos/ilgasis-atsipalaidavimas.html` (garsas ir tekstas nesutampa žodis į žodį). Instrukcijos — `audio/README.md`.
+
 ## Peržiūra kompiuteryje
 
 Iš šio katalogo (PowerShell — naudokite `;`, ne `&&`):
@@ -25,9 +27,9 @@ Arba tiesiog atidarykite `index.html` failą (navigacija veiks; kai kuriuose nar
 
 ## Tolimesni žingsniai
 
+- QR puslapis: `qr-vidine-ramybe.html` (žr. `QR_PROGRAMA.md`).
 - Pridėti kontaktų skyrių, el. paštą, socialinius tinklus.
-- 4 lygis: įkelti audio failus ir grotuvą (arba embed iš SoundCloud / kita).
-- 5 lygis: prijungti forumą (Discourse, Circle, savas sprendimas).
+- 4 lygis: papildomi įrašai — laikytis `audio/ATTRIBUTION.txt` licencijų.
 - Talpinimas: Netlify, Vercel (tik statika), GitHub Pages arba jūsų serveris.
 
 ## Vieša nuoroda (GitHub Pages)
