@@ -3,6 +3,21 @@
 Darbo eiga **Deploy Vidinė ramybė (gh-pages)** tik nukopijuoja failus į šaką **`gh-pages`**.  
 **Tikroji svetainė** atsiranda tik tada, kai GitHub žino, kad iš tos šakos reikia **rodyti puslapį**.
 
+## Automatinis variantas (viena komanda, reikia jūsų tokeno)
+
+Negalima nustatyti GitHub iš Cursor be jūsų prisijungimo. Galite paleisti repozitorijoje:
+
+```powershell
+cd "c:\Users\dneri\Documents\Replit futures-signals-bot"
+# Sukurkite PAT: https://github.com/settings/tokens → classic → repo
+$env:GITHUB_TOKEN = "ghp_..."   # įklijuokite savo tokeną
+.\scripts\configure-github-pages.ps1
+```
+
+Skriptas per API nustato **legacy** Pages iš šakos **`gh-pages`** ir kelio **`/`**.
+
+---
+
 ## Patikrinkite (būtina)
 
 1. Eikite į: **Settings → Pages** (šis repozitorija).
