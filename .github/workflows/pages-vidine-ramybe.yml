@@ -35,3 +35,16 @@ jobs:
           folder: docs/vidine-ramybe
           branch: gh-pages
           clean: true
+
+      - name: Pages nustatymas (santrauka)
+        if: success()
+        run: |
+          echo "## Jei svetainė naršyklėje vis dar neatsidaro" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ši eiga tik **įkelia failus** į šaką \`gh-pages\`. Puslapis veiks tik įjungus **GitHub Pages**:" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. **Settings → Pages**" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. **Source:** **Deploy from a branch**" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. **Branch:** \`gh-pages\`, aplankas **/(root)** → **Save**" >> "$GITHUB_STEP_SUMMARY"
+          echo "4. Palaukite **1–10 min.**: https://skautas.github.io/Futures-Signals-Bot/" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Daugiau: **PAGES_SETUP.md** repozitorijos šaknyje." >> "$GITHUB_STEP_SUMMARY"
