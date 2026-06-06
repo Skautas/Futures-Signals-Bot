@@ -30,18 +30,21 @@
 
 html {
   scroll-behavior: smooth;
-  /* Mobilus Safari: pilnas „viewport“ aukštis su adreso juosta */
   min-height: 100%;
+  background-color: var(--void);
+  /* Fono sluoksnis žemiau body — patikimiau nei body + background-attachment (ypač iOS) */
 }
 
-body {
-  margin: 0;
-  font-family: var(--font-sans);
-  font-size: 1.05rem;
-  line-height: 1.65;
-  color: var(--text);
+html::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  width: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
+  pointer-events: none;
   background-color: var(--void);
-  /* Paveikslas + tamsūs sluoksniai skaitomumui ir gylio jausmui */
   background-image: linear-gradient(
       165deg,
       rgba(6, 10, 28, 0.82) 0%,
@@ -53,30 +56,32 @@ body {
   background-size: cover;
   background-position: center center;
   background-repeat: no-repeat;
-  background-attachment: fixed;
-  min-height: 100vh;
-  min-height: 100dvh;
-}
-
-/* Lietimui / siauram ekranui: fixed fonas dažnai sugenda (pilkas, neteisingas crop) */
-@media (pointer: coarse), (max-width: 1024px) {
-  body {
-    background-attachment: scroll;
-    background-size: cover;
-    background-position: center center;
-    min-height: 100vh;
-    min-height: 100dvh;
-  }
+  transform: translateZ(0);
 }
 
 @supports (-webkit-touch-callout: none) {
   html {
     min-height: -webkit-fill-available;
   }
-  body {
-    background-attachment: scroll;
+  html::before {
     min-height: -webkit-fill-available;
   }
+  body {
+    min-height: -webkit-fill-available;
+  }
+}
+
+body {
+  margin: 0;
+  position: relative;
+  z-index: 0;
+  font-family: var(--font-sans);
+  font-size: 1.05rem;
+  line-height: 1.65;
+  color: var(--text);
+  background: transparent;
+  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 a {
