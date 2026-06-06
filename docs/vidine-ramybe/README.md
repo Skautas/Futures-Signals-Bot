@@ -32,11 +32,13 @@ Arba tiesiog atidarykite `index.html` failą (navigacija veiks; kai kuriuose nar
 
 ## Vieša nuoroda (GitHub Pages)
 
-Po **push** į GitHub ir įjungus Pages (**Settings → Pages → Branch `main`, folder `/docs`**), svetainės kopija bus adresu:
+Po **push** ir įjungus **GitHub Actions** Pages (**Settings → Pages → Source: GitHub Actions**), svetainė bus šaknyje:
 
-**https://skautas.github.io/Futures-Signals-Bot/vidine-ramybe/**
+**https://skautas.github.io/Futures-Signals-Bot/**
 
-Šaltinis talpinimui: aplankas `docs/vidine-ramybe/` repozitorijoje. Sinchronizuokite po pakeitimų:
+(Jei naudojate tik „Deploy from branch“ su aplanku **`/docs`**, tada adresas su poaplankiu: `.../vidine-ramybe/` — žr. `docs/vidine-ramybe/VIESA_NUORODA.md`.)
+
+Šaltinis talpinimui: aplankas `docs/vidine-ramybe/`. Sinchronizuokite po pakeitimų:
 
 ```powershell
 robocopy "c:\Users\dneri\Documents\Replit futures-signals-bot\vidines_ramybes_mokykla" "c:\Users\dneri\Documents\Replit futures-signals-bot\docs\vidine-ramybe" /E /MIR
