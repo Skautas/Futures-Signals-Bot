@@ -1,0 +1,36 @@
+MEDITACIJŲ ĮRAŠŲ AUTORYSTĖ (01–06)
+==================================
+
+Visi šeši MP3 failai šiame kataloge yra nekeisti įrašai iš UCLA Mindful
+(UCLA Health — Mindful Awareness Research Center), vedami anglų kalba.
+
+Šaltinis (oficiali kolekcija):
+  https://www.uclahealth.org/uclamindful/guided-meditations
+
+Licencija (nurodyta UCLA Mindful puslapyje):
+  Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+  https://creativecommons.org/licenses/by-nc-nd/4.0/
+
+Santrumpa: nekomercinis naudojimas, autoriaus nurodymas, neplatinti
+pakeistų / išvestinių versijų. Čia talpinami tik originalūs garso įrašai
+(be redagavimo); failų vardai pakeisti tik statinės svetainės struktūrai.
+
+Žemėlapis (UCLA CloudFront failas → failas šiame projekte):
+  01_Breathing_Meditation.mp3
+    → 01-kvepavimas-ir-kunas.mp3
+  Body-Sound-Meditation.mp3
+    → 02-ryto-ramybe.mp3
+  Body-Scan-Meditation.mp3
+    → 03-kuno-skanavimas.mp3
+  Body-Scan-for-Sleep.mp3
+    → 04-vakaro-uzbaigimas.mp3
+  02_Breath_Sound_Body_Meditation.mp3
+    → 05-demesys-grazinimas.mp3
+  03_Complete_Meditation_Instructions.mp3
+    → 06-ilgasis-atsipalaidavimas.mp3
+
+Pagrindas URL:
+  https://d1cy5zxxhbcbkk.cloudfront.net/guided-meditations/<failo-vardas>
+
+Pastaba: puslapyje „Ilgasis atsipalaidavimas“ lietuviškas tekstas yra
+atskira medžiaga skaitymui — ne šio UCLA įrašo transkripcija.

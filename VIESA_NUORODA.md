@@ -21,6 +21,9 @@ Jei workflow dar nebuvo paleistas po paskutinio push — **Actions** → **Deplo
 
 **https://skautas.github.io/Futures-Signals-Bot/**
 
+**QR puslapis (svetainė arba Telegram):**  
+https://skautas.github.io/Futures-Signals-Bot/qr-vidine-ramybe.html
+
 ### Jei vis tiek 404
 
 - Dar kartą patikrinkite **Settings → Pages**: šaltinis turi būti **Deploy from a branch** → **`gh-pages`** → **`/ (root)`** (ne `main`, ne `/docs`).
@@ -31,7 +34,10 @@ Jei workflow dar nebuvo paleistas po paskutinio push — **Actions** → **Deplo
 
 ## Atnaujinimai
 
-Keičiate `vidines_ramybes_mokykla/` → sinchronizuokite į `docs/vidine-ramybe/`, `git push` — workflow vėl atnaujins `gh-pages`.
+Keičiate `vidines_ramybes_mokykla/` → sinchronizuokite į `docs/vidine-ramybe/`, tada **į commitą įtraukite visus failus**, kuriuos turi matyti svetainė (įskaitant MP3):
+
+- Jei `docs/vidine-ramybe/audio/` ar `meditacijos/` yra tik lokaliai (**ne** `git add`), GitHub Pages juose **nebūs** — telefone ir kompiuteryje grotuvai liks tušti arba nuorodos neveiks.
+- Po `git add` + `git commit` + `git push` į `main` darbo eiga vėl įkels visą `docs/vidine-ramybe/` į `gh-pages`.
 
 ## Kita vieta be GitHub
 

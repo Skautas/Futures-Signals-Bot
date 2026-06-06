@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="lt">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="QR kodas Vidinės Ramybės mokyklai ar Telegram botui — greita prieiga iš telefono."
+    />
+    <meta name="theme-color" content="#060818" />
+    <title>QR — Vidinės Ramybės Mokykla</title>
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      .qr-page {
+        max-width: 28rem;
+        margin: 0 auto;
+        padding: 1.25rem 1.25rem 3rem;
+      }
+      .qr-back {
+        display: inline-block;
+        margin-bottom: 1rem;
+        font-size: 0.95rem;
+      }
+      .qr-card {
+        padding: 1.35rem 1.25rem;
+        border-radius: var(--radius, 16px);
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.06);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      }
+      .qr-card h1 {
+        font-family: var(--font-serif);
+        font-size: 1.35rem;
+        margin: 0 0 0.5rem;
+        color: var(--text);
+      }
+      .qr-card .lead {
+        color: var(--muted);
+        font-size: 0.95rem;
+        line-height: 1.55;
+        margin: 0 0 1.25rem;
+      }
+      .qr-field label {
+        display: block;
+        font-size: 0.88rem;
+        color: var(--text-soft);
+        margin-bottom: 0.35rem;
+      }
+      .qr-field input {
+        width: 100%;
+        padding: 0.65rem 0.75rem;
+        border-radius: 10px;
+        border: 1px solid var(--line-strong);
+        background: rgba(6, 10, 28, 0.65);
+        color: var(--text);
+        font-size: 1rem;
+        margin-bottom: 0.75rem;
+      }
+      .qr-field input:focus {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .qr-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+      }
+      .qr-actions button {
+        flex: 1 1 auto;
+        min-width: 8rem;
+        padding: 0.55rem 0.75rem;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: rgba(110, 184, 255, 0.12);
+        color: var(--accent-bright);
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
+      .qr-actions button:hover {
+        background: rgba(110, 184, 255, 0.22);
+      }
+      .qr-primary {
+        width: 100%;
+        padding: 0.7rem 1rem;
+        margin-bottom: 1.25rem;
+        border-radius: 10px;
+        border: none;
+        background: linear-gradient(135deg, var(--accent-deep), var(--accent));
+        color: #fff;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .qr-primary:hover {
+        filter: brightness(1.08);
+      }
+      .qr-canvas-wrap {
+        display: flex;
+        justify-content: center;
+        padding: 1rem;
+        background: #fff;
+        border-radius: 12px;
+        margin-bottom: 1rem;
+      }
+      .qr-canvas-wrap canvas {
+        max-width: 100%;
+        height: auto !important;
+      }
+      .qr-url-out {
+        word-break: break-all;
+        font-size: 0.82rem;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      .qr-err {
+        color: #f9a8a8;
+        font-size: 0.9rem;
+        margin-top: 0.5rem;
+      }
+      .qr-hint {
+        margin-top: 1.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid var(--line);
+        font-size: 0.88rem;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip-link" href="#qr-main">Pereiti prie QR</a>
+
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="logo" href="index.html">Vidinės Ramybės Mokykla</a>
+        <button
+          type="button"
+          class="nav-toggle"
+          aria-expanded="false"
+          aria-controls="main-nav"
+        >
+          Meniu
+        </button>
+        <nav id="main-nav" class="nav" aria-label="Pagrindinė navigacija">
+          <ul class="nav-list">
+            <li><a href="index.html#lygis-1">1 lygis</a></li>
+            <li><a href="index.html#lygis-4">Meditacijos</a></li>
+            <li><a href="qr-vidine-ramybe.html" aria-current="page">QR</a></li>
+          </ul>
+        </nav>
+      </div>
+    </header>
+
+    <div class="qr-page" id="qr-main">
+      <a class="qr-back" href="index.html">← Atgal į svetainę</a>
+
+      <div class="qr-card">
+        <h1>QR kodas</h1>
+        <p class="lead">
+          Nuskenuokite telefonu — atsidarys nurodyta nuoroda (svetainė arba
+          Telegram botas). Nuorodą galite pakeisti žemiau; naršyklė gali ją
+          įsiminti šiame įrenginyje.
+        </p>
+
+        <div class="qr-field">
+          <label for="qr-url">Adresas (URL)</label>
+          <input
+            id="qr-url"
+            type="url"
+            inputmode="url"
+            autocomplete="url"
+            placeholder="https://…"
+          />
+        </div>
+
+        <div class="qr-actions" role="group" aria-label="Greiti nustatymai">
+          <button type="button" id="preset-site-4">Svetainė · 4 lygis</button>
+          <button type="button" id="preset-site-home">Svetainė · pradžia</button>
+        </div>
+
+        <button type="button" class="qr-primary" id="qr-generate">
+          Atnaujinti QR kodą
+        </button>
+
+        <div class="qr-canvas-wrap" aria-live="polite">
+          <canvas id="qr-canvas" width="280" height="280" hidden></canvas>
+        </div>
+        <p class="qr-url-out" id="qr-url-display"></p>
+        <p class="qr-err" id="qr-error" hidden></p>
+
+        <div class="qr-hint">
+          <strong>Telegram botui:</strong> įrašykite savo boto nuorodą, pvz.
+          <code>https://t.me/JusuBotas</code> (BotFather → t.me vardas), tada
+          paspauskite „Atnaujinti QR kodą“. Jei boto dar nėra, laikykite numatytąją
+          svetainės nuorodą arba įkelkite šį puslapį į telefoną ir vėliau pakeiskite
+          URL.
+        </div>
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <p><a href="index.html">Pagrindinis puslapis</a></p>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+    <script src="app.js" defer></script>
+    <script>
+      (function () {
+        var STORAGE_KEY = "vrm_qr_target_url";
+        var DEFAULT_URL = "https://skautas.github.io/Futures-Signals-Bot/#lygis-4";
+
+        var input = document.getElementById("qr-url");
+        var btn = document.getElementById("qr-generate");
+        var canvas = document.getElementById("qr-canvas");
+        var errEl = document.getElementById("qr-error");
+        var outEl = document.getElementById("qr-url-display");
+
+        function showErr(msg) {
+          errEl.textContent = msg || "";
+          errEl.hidden = !msg;
+        }
+
+        function loadUrl() {
+          try {
+            var saved = localStorage.getItem(STORAGE_KEY);
+            input.value = saved || DEFAULT_URL;
+          } catch (e) {
+            input.value = DEFAULT_URL;
+          }
+        }
+
+        function saveUrl(u) {
+          try {
+            localStorage.setItem(STORAGE_KEY, u);
+          } catch (e) {}
+        }
+
+        function draw() {
+          var text = (input.value || "").trim();
+          showErr("");
+          if (!text) {
+            showErr("Įveskite URL.");
+            canvas.hidden = true;
+            outEl.textContent = "";
+            return;
+          }
+          try {
+            var u = new URL(text);
+            if (u.protocol !== "http:" && u.protocol !== "https:") {
+              showErr("Naudokite http arba https nuorodą.");
+              canvas.hidden = true;
+              outEl.textContent = "";
+              return;
+            }
+          } catch (e) {
+            showErr("Netinkama nuoroda. Pavyzdys: https://t.me/Vardas");
+            canvas.hidden = true;
+            outEl.textContent = "";
+            return;
+          }
+
+          if (typeof QRCode === "undefined") {
+            showErr("Nepavyko įkelti QR bibliotekos. Patikrinkite internetą.");
+            canvas.hidden = true;
+            return;
+          }
+
+          QRCode.toCanvas(
+            canvas,
+            text,
+            { width: 280, margin: 2, color: { dark: "#0a0e1a", light: "#ffffff" } },
+            function (err) {
+              if (err) {
+                showErr("QR generavimo klaida.");
+                canvas.hidden = true;
+                outEl.textContent = "";
+                return;
+              }
+              canvas.hidden = false;
+              outEl.textContent = "Koduota: " + text;
+              saveUrl(text);
+            }
+          );
+        }
+
+        document.getElementById("preset-site-4").addEventListener("click", function () {
+          input.value = DEFAULT_URL;
+          draw();
+        });
+        document.getElementById("preset-site-home").addEventListener("click", function () {
+          input.value = "https://skautas.github.io/Futures-Signals-Bot/";
+          draw();
+        });
+
+        btn.addEventListener("click", draw);
+        input.addEventListener("keydown", function (e) {
+          if (e.key === "Enter") draw();
+        });
+
+        loadUrl();
+        draw();
+      })();
+    </script>
+  </body>
+</html>
