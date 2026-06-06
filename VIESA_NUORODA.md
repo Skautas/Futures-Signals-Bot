@@ -21,6 +21,12 @@ Jei workflow dar nebuvo paleistas po paskutinio push — **Actions** → **Deplo
 
 **https://skautas.github.io/Futures-Signals-Bot/**
 
+### Jei vis tiek 404
+
+- Dar kartą patikrinkite **Settings → Pages**: šaltinis turi būti **Deploy from a branch** → **`gh-pages`** → **`/ (root)`** (ne `main`, ne `/docs`).
+- Palaukite **iki 10 minučių** po „Save“.
+- Jei repozitorija **privati** — GitHub Pages gali būti nepasiekiamas nemokamai; žr. repozitorijos šaknyje **`PAGES_SETUP.md`**.
+
 ---
 
 ## Atnaujinimai
