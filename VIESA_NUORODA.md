@@ -24,6 +24,9 @@ Jei workflow dar nebuvo paleistas po paskutinio push — **Actions** → **Deplo
 **QR puslapis (svetainė arba Telegram):**  
 https://skautas.github.io/Futures-Signals-Bot/qr-vidine-ramybe.html
 
+**Nušvitimo kelias (struktūra ir nuorodos):**  
+https://skautas.github.io/Futures-Signals-Bot/kelias.html
+
 ### Jei vis tiek 404
 
 - Dar kartą patikrinkite **Settings → Pages**: šaltinis turi būti **Deploy from a branch** → **`gh-pages`** → **`/ (root)`** (ne `main`, ne `/docs`).

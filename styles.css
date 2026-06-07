@@ -531,6 +531,142 @@ main {
   }
 }
 
+/* Nušvitimo kelias (kelias.html) */
+.path-hero {
+  padding-bottom: 2.5rem;
+}
+
+.path-note {
+  max-width: 62ch;
+  margin: 0 auto 2.25rem;
+  padding: 1rem 1.15rem;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--text-soft);
+  background: rgba(12, 20, 48, 0.55);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.path-map {
+  margin-bottom: 2.5rem;
+}
+
+.path-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-width: 52rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.path-step {
+  margin: 0;
+  padding: 0;
+}
+
+.path-step-card {
+  display: flex;
+  gap: 1rem 1.25rem;
+  align-items: flex-start;
+  padding: 1.25rem 1.35rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: 0 8px 32px var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.path-step-marker {
+  flex-shrink: 0;
+  width: 2.5rem;
+  height: 2.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: #fff;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-deep), var(--accent));
+  box-shadow: 0 0 20px rgba(110, 184, 255, 0.35);
+}
+
+.path-step-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.path-step-title {
+  font-family: var(--font-serif);
+  font-size: 1.25rem;
+  margin: 0 0 0.65rem;
+  color: #fff;
+  line-height: 1.3;
+}
+
+.path-step-card p {
+  margin: 0 0 0.75rem;
+  color: var(--text-soft);
+  line-height: 1.65;
+  font-size: 0.98rem;
+}
+
+.path-step-card p:last-child {
+  margin-bottom: 0;
+}
+
+.path-step-links {
+  font-size: 0.9rem;
+  margin-top: 0.85rem !important;
+}
+
+.path-step-links a {
+  white-space: nowrap;
+}
+
+.path-arrow {
+  display: block;
+  text-align: center;
+  padding: 0.35rem 0 0.85rem;
+  font-size: 1.35rem;
+  color: var(--muted);
+  line-height: 1;
+  text-shadow: 0 0 12px rgba(110, 184, 255, 0.2);
+}
+
+.path-step--last .path-arrow {
+  display: none;
+}
+
+.path-closing {
+  max-width: 52rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.nav-list a[aria-current="page"] {
+  color: var(--accent-bright);
+  background: rgba(110, 184, 255, 0.15);
+}
+
+@media (max-width: 600px) {
+  .path-step-card {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .path-step-marker {
+    width: 2.25rem;
+    height: 2.25rem;
+    font-size: 1rem;
+  }
+
+  .path-step-links a {
+    white-space: normal;
+  }
+}
+
 /* Pilno ekrano skaitymui (mygtuką kuria app.js) */
 .vrm-fullscreen-btn {
   position: fixed;
