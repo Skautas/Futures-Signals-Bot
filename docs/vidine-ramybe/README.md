@@ -1,4 +1,4 @@
-# Vidinės Ramybės Mokykla
+# Vidinė Ramybė
 
 Statinė vieno puslapio svetainė (HTML + CSS + JS), lietuvių kalba.
 
