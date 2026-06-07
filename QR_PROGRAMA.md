@@ -1,4 +1,4 @@
-# QR programa (Vidinės Ramybės Mokykla)
+# QR programa (Vidinė Ramybė)
 
 ## Kas tai
 
