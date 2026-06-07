@@ -667,6 +667,254 @@ main {
   }
 }
 
+.path-map-heading {
+  font-family: var(--font-serif);
+  font-size: clamp(1.35rem, 3vw, 1.65rem);
+  font-weight: 600;
+  color: #fff;
+  text-align: center;
+  margin: 2.75rem auto 0.25rem;
+  max-width: 40rem;
+  line-height: 1.35;
+}
+
+.path-narrative {
+  max-width: 48rem;
+  margin: 0 auto 2.5rem;
+}
+
+.path-narrative-title {
+  font-family: var(--font-serif);
+  font-size: clamp(1.5rem, 3.5vw, 1.85rem);
+  color: #fff;
+  margin: 0 0 1.5rem;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.path-stage {
+  margin-bottom: 1.75rem;
+  padding: 1.2rem 1.35rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: rgba(8, 14, 40, 0.45);
+}
+
+.path-stage:last-child {
+  margin-bottom: 0;
+}
+
+.path-stage-title {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+  font-family: var(--font-serif);
+  font-size: 1.2rem;
+  color: #fff;
+  margin: 0 0 0.75rem;
+  line-height: 1.3;
+}
+
+.path-stage-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  height: 2rem;
+  padding: 0 0.35rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #fff;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent-deep), var(--accent));
+}
+
+.path-stage p {
+  margin: 0 0 0.65rem;
+  color: var(--text-soft);
+  line-height: 1.65;
+  font-size: 0.98rem;
+}
+
+.path-stage ul {
+  margin: 0.35rem 0 0.75rem;
+  padding-left: 1.25rem;
+  color: var(--text-soft);
+  line-height: 1.6;
+}
+
+.path-stage li {
+  margin-bottom: 0.35rem;
+}
+
+.path-stage-more {
+  margin: 0.75rem 0 0 !important;
+  font-size: 0.92rem;
+}
+
+/* Pagrindinis — Sąmonės kelias blokai */
+.hero-eyebrow {
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 0.5rem;
+}
+
+.hero-kicker {
+  font-family: var(--font-serif);
+  font-size: clamp(1.35rem, 4vw, 1.85rem);
+  font-weight: 600;
+  color: var(--accent-bright);
+  margin: 0.35rem auto 1.25rem;
+  max-width: 22ch;
+  line-height: 1.25;
+  text-shadow: 0 0 28px rgba(110, 200, 255, 0.35);
+}
+
+.hero-prose {
+  max-width: 40rem;
+  margin: 0 auto 1.5rem;
+  text-align: left;
+}
+
+.hero-prose p {
+  margin: 0 0 0.85rem;
+  color: var(--text-soft);
+  line-height: 1.65;
+  font-size: 1.02rem;
+}
+
+.hero-prose p:last-child {
+  margin-bottom: 0;
+}
+
+.home-block {
+  max-width: 52rem;
+  margin: 0 auto 2.25rem;
+  padding: 1.35rem 1.4rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: rgba(10, 16, 42, 0.5);
+  box-shadow: 0 6px 28px var(--shadow);
+}
+
+.home-block h2 {
+  font-family: var(--font-serif);
+  font-size: 1.35rem;
+  color: #fff;
+  margin: 0 0 1rem;
+}
+
+.home-block-lead {
+  margin: 1rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+.checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.checklist li {
+  position: relative;
+  padding: 0.45rem 0 0.45rem 2rem;
+  color: var(--text-soft);
+  line-height: 1.5;
+  border-bottom: 1px solid rgba(120, 170, 255, 0.12);
+}
+
+.checklist li:last-child {
+  border-bottom: none;
+}
+
+.checklist li::before {
+  content: "✓";
+  position: absolute;
+  left: 0.15rem;
+  top: 0.42rem;
+  color: var(--accent-bright);
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.home-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem 2rem;
+}
+
+.home-subh {
+  font-size: 1rem;
+  color: var(--accent-bright);
+  margin: 0 0 0.65rem;
+  font-weight: 600;
+}
+
+.home-list {
+  margin: 0 0 1rem;
+  padding-left: 1.2rem;
+  color: var(--text-soft);
+  line-height: 1.55;
+}
+
+.home-block-cta {
+  margin: 0.5rem 0 0;
+}
+
+.home-inline-links {
+  margin: 0.75rem 0 0;
+  font-size: 0.92rem;
+}
+
+.home-inline-links a {
+  color: var(--accent-bright);
+}
+
+.home-diena {
+  border-left: 4px solid var(--accent);
+  background: rgba(20, 32, 72, 0.4);
+}
+
+.home-questions {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+}
+
+.home-questions li {
+  font-style: italic;
+  color: var(--text-soft);
+  padding: 0.35rem 0;
+  border-bottom: 1px solid rgba(120, 170, 255, 0.1);
+}
+
+.home-questions li:last-child {
+  border-bottom: none;
+}
+
+.home-apie p {
+  color: var(--text-soft);
+  line-height: 1.65;
+  margin: 0 0 0.75rem;
+}
+
+.home-welcome {
+  margin: 1.25rem 0 0;
+  font-size: 1.05rem;
+  color: var(--text);
+}
+
+@media (max-width: 700px) {
+  .home-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* Pilno ekrano skaitymui (mygtuką kuria app.js) */
 .vrm-fullscreen-btn {
   position: fixed;
